@@ -1,0 +1,16 @@
+{
+  "protocol_name": "min degerler",
+  "printhead_number": 1,
+  "layer_thickness_mm": 0.1,
+  "print_speed_mm_s": 1.0,
+  "grid_type": "Linear",
+  "grid_distance_mm": 0.01,
+  "printhead_temperature_c": 4.0,
+  "platform_temperature_c": -30.0,
+  "built_platform": {
+    "type_index": 2,
+    "petri_diameter_mm": null,
+    "well_format": null,
+    "glass_size_mm": "20x650"
+  }
+}

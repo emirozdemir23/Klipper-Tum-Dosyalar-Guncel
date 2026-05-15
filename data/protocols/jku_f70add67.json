@@ -1,0 +1,16 @@
+{
+  "protocol_name": "jku",
+  "printhead_number": 1,
+  "layer_thickness_mm": 0.2,
+  "print_speed_mm_s": 10.0,
+  "grid_type": "Linear",
+  "grid_distance_mm": 0.2,
+  "printhead_temperature_c": 27.0,
+  "platform_temperature_c": -30.0,
+  "built_platform": {
+    "type_index": 0,
+    "petri_diameter_mm": "60",
+    "well_format": null,
+    "glass_size_mm": null
+  }
+}
