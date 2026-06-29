@@ -1,0 +1,18 @@
+{
+  "protocol_name": "mindegerdeneme",
+  "printhead_number": 3,
+  "layer_thickness_mm": 0.1,
+  "print_speed_mm_s": 1.0,
+  "grid_type": "Linear",
+  "grid_distance_mm": 0.01,
+  "printhead_temperature_c": 4.0,
+  "platform_temperature_c": -30.0,
+  "model_name": "cube.stl",
+  "stl_path": "C:/Users/cğjiğl/Desktop/cube.stl",
+  "built_platform": {
+    "type_index": 1,
+    "petri_diameter_mm": null,
+    "well_format": 12,
+    "glass_size_mm": null
+  }
+}

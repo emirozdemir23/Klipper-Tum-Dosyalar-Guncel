@@ -1,0 +1,18 @@
+{
+  "protocol_name": "deneme1",
+  "printhead_number": 3,
+  "layer_thickness_mm": 0.19,
+  "print_speed_mm_s": 15.0,
+  "grid_type": "Linear",
+  "grid_distance_mm": 0.23,
+  "printhead_temperature_c": 43.0,
+  "platform_temperature_c": -26.0,
+  "model_name": "cube.stl",
+  "stl_path": "C:/Users/cğjiğl/Desktop/cube.stl",
+  "built_platform": {
+    "type_index": 0,
+    "petri_diameter_mm": "10",
+    "well_format": null,
+    "glass_size_mm": null
+  }
+}

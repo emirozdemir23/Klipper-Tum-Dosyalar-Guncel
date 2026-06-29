@@ -1,0 +1,907 @@
+[mcu]
+serial: /dev/serial/by-id/usb-Klipper_stm32f407xx_490047000B51353139363338-if00
+
+baud: 250000
+restart_method: command
+
+
+#--------------------------------------------------------------------
+##--------------------------------------------------------------------
+[printer]
+kinematics: cartesian
+max_velocity: 150 
+max_accel: 2000   			#Max 4000
+max_z_velocity: 15 			#Max 15 for 12V TMC Drivers, can increase for 24V
+max_z_accel: 30
+square_corner_velocity: 5.0
+
+[stepper_x]
+step_pin:PC14
+dir_pin:!PC13
+# HARDWARE BRIDGE: X and Z enable pins are physically bridged on PCB. Keep !PC15.
+enable_pin:!PC15
+microsteps: 16
+rotation_distance: 4
+full_steps_per_rotation:200  #set to 400 for 0.9 degree stepper
+endstop_pin:^!PA14
+position_min: 0  
+position_endstop: 0
+position_max: 230
+
+#--------------------------------------------------------------------
+homing_speed:10
+homing_retract_dist:5
+homing_positive_dir:false
+
+[stepper_y]
+step_pin:PE1
+dir_pin:PE0
+enable_pin:!PE2
+microsteps:16
+rotation_distance: 4
+full_steps_per_rotation:200  #set to 400 for 0.9 degree stepper
+endstop_pin:^!PA15
+position_min: 0
+position_endstop:0
+position_max:120
+
+#--------------------------------------------------------------------
+homing_speed:10
+homing_retract_dist:5
+homing_positive_dir:false
+
+[stepper_z]
+step_pin:PE5
+dir_pin:PE4
+# HARDWARE BRIDGE: X and Z enable pins are physically bridged on PCB. Keep !PC15.
+enable_pin: !PC15
+microsteps: 16
+rotation_distance: 2
+full_steps_per_rotation: 200
+endstop_pin:^!PB11 ## PB12 for Z-max; endstop have'!' is NO
+
+##  Z-position of nozzle (in mm) to z-endstop trigger point relative to print surface (Z0)
+##  (+) value = endstop above Z0, (-) value = endstop below
+##	Increasing position_endstop brings nozzle closer to the bed
+##  After you run Z_ENDSTOP_CALIBRATE, position_endstop will be stored at the very end of your config
+position_endstop: 83
+position_max: 83
+position_min: 0
+homing_speed: 8
+second_homing_speed: 3
+homing_retract_dist:5
+homing_positive_dir: true
+
+[manual_stepper z1]
+step_pin: PB5
+dir_pin: PB4
+enable_pin: !PB6
+microsteps: 16
+rotation_distance: 2
+full_steps_per_rotation: 200
+endstop_pin: ^!PB12
+velocity: 5 
+accel: 100      
+
+[manual_stepper z2]
+step_pin: PD6
+dir_pin: PD5
+# PAYLASILAN ENABLE (PD7): MKS Monster8'de bu pin, asagidaki [extruder_stepper
+# recine_3]'un enable'i ile DONANIMSAL olarak koprulu. Klipper ayni enable pinini
+# birden cok stepper'da paylasmaya IZIN VERIR (share_type='stepper_enable') → iki
+# motor TEK enable sinyalini paylasir, "Duplicate Pin" hatasi OLUSMAZ. Bilerek boyle.
+enable_pin: !PD7
+microsteps: 16
+rotation_distance: 2
+full_steps_per_rotation: 200
+endstop_pin: ^!PB13
+velocity: 5
+accel: 100
+
+#--------------------------------------------------------------------
+# SIRINGA MOTORLARI — extruder_stepper (eski [manual_stepper recine_X] yerine).
+# Endstop YOK: extruder_stepper endstop desteklemez; bu mimarinin amaci da bu
+# (Klipper'in manual_stepper endstop kisitini bypass etmek). 'extruder:' BOS →
+# boot'ta hicbir motion queue'ya bagli degil; T0/T1/T2 makrolari ile baglanir.
+#--------------------------------------------------------------------
+[extruder_stepper recine_1]
+extruder:
+step_pin: PD2
+dir_pin: !PD1
+enable_pin: !PD3
+microsteps: 16
+rotation_distance: 0.8
+
+[extruder_stepper recine_2]
+extruder:
+step_pin: PC7
+dir_pin: !PC6
+enable_pin: !PC8
+microsteps: 16
+rotation_distance: 0.8
+
+[extruder_stepper recine_3]
+extruder:
+step_pin: PD13
+dir_pin: !PD12
+# PAYLASILAN ENABLE (PD7): yukaridaki [manual_stepper z2] ile DONANIMSAL koprulu AYNI
+# pin (bkz. oradaki not). Klipper native paylasimi yeterli — [output_pin] alias'a
+# GEREK YOK ve zaten CALISMAZ (stepper enable_pin bir [output_pin] adini referans alamaz).
+enable_pin: !PD7
+microsteps: 16
+rotation_distance: 0.8
+
+
+[extruder]
+# DUMMY MASTER: motor pinleri YOK (step/dir/enable). Klipper step_pin yoksa
+# bu extruder'i MOTORSUZ (yalnizca isitici + motion queue) olarak kurar. 3 siringa
+# [extruder_stepper recine_X] bu motion queue'ya SYNC olur. nozzle/filament_diameter
+# ZORUNLU (Klipper varsayilansiz okur) → birakildi.
+nozzle_diameter: 0.400
+filament_diameter: 1.750
+
+# DUMMY HEATER: gercek isitici+termistor pinleri artik peltier_1'e tasindi.
+# Bu [extruder] yalnizca MOTION QUEUE master'i — fiziksel isiticisi YOK.
+# PA6/PC4 KULLANILMAYAN dummy pinler (Klipper extruder icin sahte isitici zorunlu).
+heater_pin: PA6
+sensor_type: NTC 100K MGB18-104F39050L32
+sensor_pin: PC4
+min_temp: -273    # Sensor kopuksa bile ariza vermesin diye mutlak sifir
+max_temp: 275
+control: pid  
+pid_kp: 26.213
+pid_ki: 1.304
+pid_kd: 131.721
+
+# --- Bioprinter surekli ekstruzyon guvenlik gevsetmeleri (KRITIK) ---
+min_extrude_temp: -273         # bos PC4 dummy sensoru ~-45C okur; -273 ile
+                               # "Extrude below minimum temp" kilidini ASLA tetiklemez
+                               # → soguk ekstruzyon her zaman serbest (hidrojel)
+max_extrude_only_distance: 500 # uzun surekli E hamlelerine izin ver
+max_extrude_cross_section: 50  # genis kesit (siringa, ince nozul degil)
+
+#####################################################################
+# 	Peltier sicaklik kontrolculeri (3x bagimsiz generic heater)
+#####################################################################
+# Her peltier KENDI termistorunu okur. sensor_type dosyadaki diger
+# sensorlerle ayni. control: pid (siki sicaklik tutusu icin). HER peltier'i
+# PID_CALIBRATE HEATER=peltier_x TARGET=37 ile KALIBRE ET — asagidaki pid_kp/ki/kd
+# yalnizca placeholder. min/max_temp makul varsayilan — donanima gore gozden gecir.
+[heater_generic peltier_1]
+gcode_id: P1
+heater_pin: PB1
+sensor_type: NTC 100K MGB18-104F39050L32
+sensor_pin: PC1
+# PID CALIBRATION REQUIRED: Run PID_CALIBRATE HEATER=peltier_1 TARGET=37
+control: pid
+pid_kp: 22.2
+pid_ki: 1.08
+pid_kd: 114.2
+min_temp: -20
+max_temp: 150
+
+[heater_generic peltier_2]
+gcode_id: P2
+heater_pin: PB0
+sensor_type: NTC 100K MGB18-104F39050L32
+sensor_pin: PC2
+# PID CALIBRATION REQUIRED: Run PID_CALIBRATE HEATER=peltier_2 TARGET=37
+control: pid
+pid_kp: 22.2
+pid_ki: 1.08
+pid_kd: 114.2
+min_temp: -20
+max_temp: 150
+
+[heater_generic peltier_3]
+gcode_id: P3
+heater_pin: PA3
+sensor_type: NTC 100K MGB18-104F39050L32
+sensor_pin: PC3
+# PID CALIBRATION REQUIRED: Run PID_CALIBRATE HEATER=peltier_3 TARGET=37
+control: pid
+pid_kp: 22.2
+pid_ki: 1.08
+pid_kd: 114.2
+min_temp: -20
+max_temp: 150
+
+# YATAK SOGUTUCU: bed Peltier'i artik HEATER degil, temperature_fan olarak surulur.
+# watermark (bang-bang): yatak sicakligi target+max_delta'yi gecince Peltier (PB10)
+# devreye girer, target-max_delta altina dusunce kapanir. Strictly SOGUTMA.
+[temperature_fan bed_cooler]
+pin: PB10
+sensor_type: NTC 100K MGB18-104F39050L32
+sensor_pin: PC0
+control: watermark
+max_delta: 2.0
+min_temp: -40
+max_temp: 100
+
+# --- Peltier sogutucu (heatsink) fanlari ---
+# [heater_fan], bagli peltier heater'i AKTIF oldugunda otomatik calisir; heater
+# kapaninca sicaklik heater_temp altina dusene kadar doner. shutdown_speed:1 →
+# Klipper kapanirsa fan tam hizda (sicak yuzeyi korur).
+[heater_fan peltier_1_fan]
+pin: PA0
+heater: peltier_1
+heater_temp: 40
+shutdown_speed: 1
+
+[heater_fan peltier_2_fan]
+pin: PA1
+heater: peltier_2
+heater_temp: 40
+shutdown_speed: 1
+
+[heater_fan peltier_3_fan]
+pin: PA2
+heater: peltier_3
+heater_temp: 40
+shutdown_speed: 1
+
+#####################################################################
+#	Homing and Gantry Adjustment Routines
+#####################################################################
+[idle_timeout]
+timeout: 3600
+
+########################################
+# TMC UART configuration
+########################################
+
+[tmc2209 stepper_x]
+uart_pin: PE6
+interpolate: True
+run_current: 0.8
+hold_current: 0.3
+sense_resistor: 0.110
+stealthchop_threshold: 9999
+
+[tmc2209 stepper_y]
+uart_pin: PB7
+interpolate: True
+run_current: 1.0
+hold_current: 0.3
+sense_resistor: 0.110
+stealthchop_threshold: 9999
+
+[tmc2209 stepper_z]
+uart_pin: PE3
+interpolate: True
+run_current: 0.8
+hold_current: 0.5
+stealthchop_threshold: 0
+
+# DEVRE DISI BIRAKILDI: dummy [extruder] artik MOTORSUZ. Bu TMC, 'klippy:connect'
+# aninda 'extruder' stepper'ini arar (stepper_enable.lookup_enable) ve bulamazsa
+# "Unknown stepper 'extruder'" hatasiyla boot'u durdurur. Siringa motorlari
+# standalone (UART'siz) surulur, bu yuzden TMC kaydina gerek yok.
+
+[tmc2209 manual_stepper z1]
+uart_pin: PB3
+interpolate: True
+run_current: 0.8
+hold_current: 0.5
+stealthchop_threshold: 0
+
+[tmc2209 manual_stepper z2]
+uart_pin: PD4
+interpolate: True
+run_current: 0.8
+hold_current: 0.5
+stealthchop_threshold: 0
+
+########################################
+# EXP1 / EXP2 (display) pins
+########################################
+
+[board_pins]
+aliases:
+    # EXP1 header
+    EXP1_10=<5V>, EXP1_9=<GND>,
+    EXP1_8=PE7,   EXP1_7=PE15,
+    EXP1_6=PD8,  EXP1_5=PD9,     # Slot in the socket on the other side
+    EXP1_4=PD10,   EXP1_3=PE11,
+    EXP1_2=PE10,   EXP1_1=PB2,
+
+######################################################################
+# MKS Mini 12864v3.0 (with neopixel backlight leds)
+######################################################################
+
+[neopixel fysetc_mini12864]
+pin: EXP1_6
+chain_count: 3
+color_order: RGB
+initial_RED: 1.0
+initial_GREEN: 1.0
+initial_BLUE: 0.0
+
+#####################################################################
+# 	Macros
+#####################################################################
+
+[gcode_macro G32]
+gcode:
+    G28
+    ##	Uncomment for for your size printer:
+    #--------------------------------------------------------------------
+    ##	Uncomment for 250mm build
+    #G0 X115 Y115 Z30 F3600
+    
+    ##	Uncomment for 300 build
+    #G0 X150 Y150 Z30 F3600
+    
+    ##	Uncomment for 350mm build
+    #G0 X175 Y175 Z30 F3600
+    #--------------------------------------------------------------------
+   
+[gcode_macro PRINT_START]
+gcode:
+    RESPOND MSG="Basim islemi baslatiliyor (SABIT YATAK modu)..."
+    G28                 ; SADECE homing. homing_override: Z tepeye(83)+KAFALARI_SIFIRLA+X/Y. Gantry yataktan UZAK.
+    G90                 ; mutlak konum modu
+    # WARNING: Manual Z-offset calibration required before absolute Z-moves.
+    # SABIT YATAK: otomatik yaklasim/prob dizisi (G1 Z5, z1/z2 inisi, PROBE, G92 Z0, Z_GANTRY_HOMING)
+    # GUVENLIK icin KALDIRILDI. Asagi/mutlak Z hareketinden ONCE Z-offset ELLE kalibre edilmeli.
+    RESPOND MSG="Home tamam. UYARI: baski oncesi Z-offset elle kalibre edilmeli (otomatik prob devre disi)."
+   
+
+[gcode_macro PRINT_END]
+#   Use PRINT_END for the slicer ending script - please customise for your slicer of choice
+gcode:
+    M400                           ; wait for buffer to clear
+    G92 E0                         ; zero the extruder
+    G1 E-10.0 F3600                ; retract filament
+    G91                            ; relative positioning
+    G0 Z1.00 X20.0 Y20.0 F20000    ; move nozzle to remove stringing
+    TURN_OFF_HEATERS
+    ; M107 KALDIRILDI: part-cooling [fan] yok (PA0/1/2 artik peltier fanlari).
+    ; Peltier heatsink fanlari [heater_fan] ile OTOMATIK — komut gerekmez.
+    G1 Z10 F500                     ; move nozzle up 2mm
+    G90                            ; absolute positioning
+    G0  X125 Y115 F500             ; park nozzle at rear (Y within 0-120)
+
+[virtual_sdcard]
+path: ~/printer_data/gcodes
+
+[pause_resume]
+
+[gcode_macro CANCEL_PRINT]
+description: Cancel the actual running print
+rename_existing: CANCEL_PRINT_BASE
+gcode:
+  TURN_OFF_HEATERS
+  CANCEL_PRINT_BASE
+  M84                  ; iptal sonrasi motorlari devre disi birak (guc/isi). Z leadscrew self-locking → gantry dusmez.
+
+#--------------------------------------------------------------------------------------
+#-Burada G28(Homing) kodunun nasıl çalışacağını belirtiyoruz. Önce Z'ler sonra X ve Y.-
+#--------------------------------------------------------------------------------------
+[homing_override]
+gcode:    
+    G28 Z
+    KAFALARI_SIFIRLA
+    G28 X Y
+    G90
+
+
+[probe]
+pin: ^!PA13          # Arduino'dan gelen Ana Z loadcell sinyali
+z_offset: 0
+speed: 3.0
+
+
+[display_status]
+
+[respond]
+
+[gcode_macro KAFA_HAFIZA]
+variable_z1_konum: 82.0
+variable_z2_konum: 82.0
+gcode:
+    # Bu boş kalacak, burası sadece değişken deposu
+
+#-------------------------------------------------------------------------------------
+#---Burada z1 ve z2 ekseni üste çıkarak end stop switch'leri üzerinden homing yapar---
+#-------------------------------------------------------------------------------------
+
+[gcode_macro KAFALARI_SIFIRLA]
+description: Z1 ve Z2'yi sıfırlar ve konumlarını HAFIZAYA kaydeder.
+gcode:
+    # --- Z1 Sıfırla ---
+    MANUAL_STEPPER STEPPER=z1 SET_POSITION=0
+    MANUAL_STEPPER STEPPER=z1 MOVE=100 SPEED=10 STOP_ON_ENDSTOP=1
+    MANUAL_STEPPER STEPPER=z1 SET_POSITION=82
+    
+    # --- Z2 Sıfırla ---
+    MANUAL_STEPPER STEPPER=z2 SET_POSITION=0
+    MANUAL_STEPPER STEPPER=z2 MOVE=100 SPEED=10 STOP_ON_ENDSTOP=1
+    MANUAL_STEPPER STEPPER=z2 SET_POSITION=82    
+
+    SET_GCODE_VARIABLE MACRO=KAFA_HAFIZA VARIABLE=z1_konum VALUE=82.0
+    SET_GCODE_VARIABLE MACRO=KAFA_HAFIZA VARIABLE=z2_konum VALUE=82.0
+
+    MANUAL_STEPPER STEPPER=z1 MOVE=80 SPEED=10
+    MANUAL_STEPPER STEPPER=z2 MOVE=80 SPEED=10
+
+    SET_GCODE_VARIABLE MACRO=KAFA_HAFIZA VARIABLE=z1_konum VALUE=80.0
+    SET_GCODE_VARIABLE MACRO=KAFA_HAFIZA VARIABLE=z2_konum VALUE=80.0
+    
+    RESPOND MSG="Kafalar sifirlandi!"
+
+#-------------------------------------------------------------------------------------
+#-------Burada z1 ve z2 ekseni yatağa değerek loadcell üzerinden homing yapar---------
+#-------------------------------------------------------------------------------------
+
+[gcode_macro Z_GANTRY_HOMING]
+# RENAMED (eski ad: YATAK_ALT_SIFIRLA). Yatak SABIT — bu makro z1/z2 GANTRY kafalarini indirir.
+# z1/z2 KENDI loadcell endstop'larina (PB12/PB13) iner: STOP_ON_ENDSTOP=1 → DOGRULANMIS hareket.
+description: GANTRY kafalarini (z1+z2) loadcell'e indirip 0 belirler. Yatak SABIT; gantry iner.
+gcode:
+    # WARNING: Stationary bed kinematics detected. This macro is disabled to prevent collision.
+    RESPOND MSG="DEVRE DISI: Z_GANTRY_HOMING sabit-yatak guvenligi icin kapatildi (carpisma onleme)."
+    # ===== ESKI GOVDE (yorumda, referans) — z1/z2 loadcell inisi =====
+    #   MANUAL_STEPPER STEPPER=z1 MOVE=0 SPEED=3 STOP_ON_ENDSTOP=1
+    #   MANUAL_STEPPER STEPPER=z1 SET_POSITION=0
+    #   SET_GCODE_VARIABLE MACRO=KAFA_HAFIZA VARIABLE=z1_konum VALUE=0.0
+    #   MANUAL_STEPPER STEPPER=z1 MOVE=10 SPEED=10
+    #   MANUAL_STEPPER STEPPER=z1 SET_POSITION=10
+    #   MANUAL_STEPPER STEPPER=z2 MOVE=0 SPEED=3 STOP_ON_ENDSTOP=1
+    #   MANUAL_STEPPER STEPPER=z2 SET_POSITION=0
+    #   SET_GCODE_VARIABLE MACRO=KAFA_HAFIZA VARIABLE=z2_konum VALUE=0.0
+    #   MANUAL_STEPPER STEPPER=z2 MOVE=10 SPEED=10
+    #   MANUAL_STEPPER STEPPER=z2 SET_POSITION=10
+
+#-------------------------------------------------------------------------------------
+#---------------------------------10 MM HAREKET MACROLARI-----------------------------
+#-------------------------------------------------------------------------------------
+
+[gcode_macro Z_ONE_DOWN_TEN]
+description: Korumalı 10mm Aşağı İndir
+gcode:
+    # 1. Kendi hafızamızdan mevcut konumu çek
+    {% set z1_mevcut = printer["gcode_macro KAFA_HAFIZA"].z1_konum | float %}
+    
+    # 2. Yeni hedefi hesapla (10 mm aşağı)
+    {% set z1_hedef = z1_mevcut - 10.0 %}
+    
+    # 3. GÜVENLİK DUVARI (Alt Limit: 0.0)
+    {% if z1_hedef < 0.0 %} {% set z1_hedef = 0.0 %} {% endif %}
+    
+    # 4. Hareketi Ateşle
+    MANUAL_STEPPER STEPPER=z1 ENABLE=1 MOVE={z1_hedef} SPEED=10 SYNC=0
+    
+    # 5. Yeni konumu tekrar hafızaya yaz!
+    SET_GCODE_VARIABLE MACRO=KAFA_HAFIZA VARIABLE=z1_konum VALUE={z1_hedef}
+    
+    RESPOND MSG="Z1 Yeni Konum -> Z1: {z1_hedef}"
+
+[gcode_macro Z_TWO_DOWN_TEN]
+description: Korumalı 10mm Aşağı İndir
+gcode:
+    # 1. Kendi hafızamızdan mevcut konumu çek
+    {% set z2_mevcut = printer["gcode_macro KAFA_HAFIZA"].z2_konum | float %}
+    
+    # 2. Yeni hedefi hesapla (10 mm aşağı)
+    {% set z2_hedef = z2_mevcut - 10.0 %}
+    
+    # 3. GÜVENLİK DUVARI (Alt Limit: 0.0)
+    {% if z2_hedef < 0.0 %} {% set z2_hedef = 0.0 %} {% endif %}
+    
+    # 4. Hareketi Ateşle
+    MANUAL_STEPPER STEPPER=z2 ENABLE=1 MOVE={z2_hedef} SPEED=10 SYNC=0
+    
+    # 5. Yeni konumu tekrar hafızaya yaz!
+    SET_GCODE_VARIABLE MACRO=KAFA_HAFIZA VARIABLE=z2_konum VALUE={z2_hedef}
+    
+    RESPOND MSG="Z2 Yeni Konum -> Z2: {z2_hedef}"
+
+  
+[gcode_macro Z_ONE_UP_TEN]
+description: Korumalı 10mm Yukarı Kaldır
+gcode:
+    {% set z1_mevcut = printer["gcode_macro KAFA_HAFIZA"].z1_konum | float %}
+    
+    {% set z1_hedef = z1_mevcut + 10.0 %}
+    
+    # GÜVENLİK DUVARI (Üst Limit: 82.0)
+    {% if z1_hedef > 82.0 %} {% set z1_hedef = 82.0 %} {% endif %}
+    
+    MANUAL_STEPPER STEPPER=z1 ENABLE=1 MOVE={z1_hedef} SPEED=10 SYNC=0
+    
+    SET_GCODE_VARIABLE MACRO=KAFA_HAFIZA VARIABLE=z1_konum VALUE={z1_hedef}
+    
+    RESPOND MSG="Z1 Yeni Konum -> Z1: {z1_hedef}"
+
+[gcode_macro Z_TWO_UP_TEN]
+description: Korumalı 10mm Yukarı Kaldır
+gcode:
+    {% set z2_mevcut = printer["gcode_macro KAFA_HAFIZA"].z2_konum | float %}
+    
+    {% set z2_hedef = z2_mevcut + 10.0 %}
+    
+    # GÜVENLİK DUVARI (Üst Limit: 82.0)
+    {% if z2_hedef > 82.0 %} {% set z2_hedef = 82.0 %} {% endif %}
+    
+    MANUAL_STEPPER STEPPER=z2 ENABLE=1 MOVE={z2_hedef} SPEED=10 SYNC=0
+    
+    SET_GCODE_VARIABLE MACRO=KAFA_HAFIZA VARIABLE=z2_konum VALUE={z2_hedef}
+    
+    RESPOND MSG="Z2 Yeni Konum -> Z2: {z2_hedef}"
+
+#-------------------------------------------------------------------------------------
+#---------------------------------5 MM HAREKET MACROLARI-----------------------------
+#-------------------------------------------------------------------------------------
+
+[gcode_macro Z_ONE_DOWN_FIVE]
+description: Korumalı 5mm Aşağı İndir
+gcode:
+    # 1. Kendi hafızamızdan mevcut konumu çek
+    {% set z1_mevcut = printer["gcode_macro KAFA_HAFIZA"].z1_konum | float %}
+    
+    # 2. Yeni hedefi hesapla (10 mm aşağı)
+    {% set z1_hedef = z1_mevcut - 5.0 %}
+    
+    # 3. GÜVENLİK DUVARI (Alt Limit: 0.0)
+    {% if z1_hedef < 0.0 %} {% set z1_hedef = 0.0 %} {% endif %}
+    
+    # 4. Hareketi Ateşle
+    MANUAL_STEPPER STEPPER=z1 ENABLE=1 MOVE={z1_hedef} SPEED=10 SYNC=0
+    
+    # 5. Yeni konumu tekrar hafızaya yaz!
+    SET_GCODE_VARIABLE MACRO=KAFA_HAFIZA VARIABLE=z1_konum VALUE={z1_hedef}
+    
+    RESPOND MSG="Z1 Yeni Konum -> Z1: {z1_hedef}"
+
+[gcode_macro Z_TWO_DOWN_FIVE]
+description: Korumalı 5mm Aşağı İndir
+gcode:
+    # 1. Kendi hafızamızdan mevcut konumu çek
+    {% set z2_mevcut = printer["gcode_macro KAFA_HAFIZA"].z2_konum | float %}
+    
+    # 2. Yeni hedefi hesapla (10 mm aşağı)
+    {% set z2_hedef = z2_mevcut - 5.0 %}
+    
+    # 3. GÜVENLİK DUVARI (Alt Limit: 0.0)
+    {% if z2_hedef < 0.0 %} {% set z2_hedef = 0.0 %} {% endif %}
+    
+    # 4. Hareketi Ateşle
+    MANUAL_STEPPER STEPPER=z2 ENABLE=1 MOVE={z2_hedef} SPEED=10 SYNC=0
+    
+    # 5. Yeni konumu tekrar hafızaya yaz!
+    SET_GCODE_VARIABLE MACRO=KAFA_HAFIZA VARIABLE=z2_konum VALUE={z2_hedef}
+    
+    RESPOND MSG="Z2 Yeni Konum -> Z2: {z2_hedef}"
+
+  
+[gcode_macro Z_ONE_UP_FIVE]
+description: Korumalı 5mm Yukarı Kaldır
+gcode:
+    {% set z1_mevcut = printer["gcode_macro KAFA_HAFIZA"].z1_konum | float %}
+    
+    {% set z1_hedef = z1_mevcut + 5.0 %}
+    
+    # GÜVENLİK DUVARI (Üst Limit: 82.0)
+    {% if z1_hedef > 82.0 %} {% set z1_hedef = 82.0 %} {% endif %}
+    
+    MANUAL_STEPPER STEPPER=z1 ENABLE=1 MOVE={z1_hedef} SPEED=10 SYNC=0
+    
+    SET_GCODE_VARIABLE MACRO=KAFA_HAFIZA VARIABLE=z1_konum VALUE={z1_hedef}
+    
+    RESPOND MSG="Z1 Yeni Konum -> Z1: {z1_hedef}"
+
+[gcode_macro Z_TWO_UP_FIVE]
+description: Korumalı 5mm Yukarı Kaldır
+gcode:
+    {% set z2_mevcut = printer["gcode_macro KAFA_HAFIZA"].z2_konum | float %}
+    
+    {% set z2_hedef = z2_mevcut + 5.0 %}
+    
+    # GÜVENLİK DUVARI (Üst Limit: 82.0)
+    {% if z2_hedef > 82.0 %} {% set z2_hedef = 82.0 %} {% endif %}
+    
+    MANUAL_STEPPER STEPPER=z2 ENABLE=1 MOVE={z2_hedef} SPEED=10 SYNC=0
+    
+    SET_GCODE_VARIABLE MACRO=KAFA_HAFIZA VARIABLE=z2_konum VALUE={z2_hedef}
+    
+    RESPOND MSG="Z2 Yeni Konum -> Z2: {z2_hedef}"
+
+#-------------------------------------------------------------------------------------
+#--------------------------------1 MM HAREKET MACROLARI-------------------------------
+#-------------------------------------------------------------------------------------
+
+[gcode_macro Z_ONE_DOWN_ONE]
+description: Korumalı 1mm Aşağı İndir
+gcode:
+    # 1. Kendi hafızamızdan mevcut konumu çek
+    {% set z1_mevcut = printer["gcode_macro KAFA_HAFIZA"].z1_konum | float %}
+    
+    # 2. Yeni hedefi hesapla (10 mm aşağı)
+    {% set z1_hedef = z1_mevcut - 1.0 %}
+    
+    # 3. GÜVENLİK DUVARI (Alt Limit: 0.0)
+    {% if z1_hedef < 0.0 %} {% set z1_hedef = 0.0 %} {% endif %}
+    
+    # 4. Hareketi Ateşle
+    MANUAL_STEPPER STEPPER=z1 ENABLE=1 MOVE={z1_hedef} SPEED=10 SYNC=0
+    
+    # 5. Yeni konumu tekrar hafızaya yaz!
+    SET_GCODE_VARIABLE MACRO=KAFA_HAFIZA VARIABLE=z1_konum VALUE={z1_hedef}
+    
+    RESPOND MSG="Z1 Yeni Konum -> Z1: {z1_hedef}"
+
+[gcode_macro Z_TWO_DOWN_ONE]
+description: Korumalı 1mm Aşağı İndir
+gcode:
+    # 1. Kendi hafızamızdan mevcut konumu çek
+    {% set z2_mevcut = printer["gcode_macro KAFA_HAFIZA"].z2_konum | float %}
+    
+    # 2. Yeni hedefi hesapla (10 mm aşağı)
+    {% set z2_hedef = z2_mevcut - 1.0 %}
+    
+    # 3. GÜVENLİK DUVARI (Alt Limit: 0.0)
+    {% if z2_hedef < 0.0 %} {% set z2_hedef = 0.0 %} {% endif %}
+    
+    # 4. Hareketi Ateşle
+    MANUAL_STEPPER STEPPER=z2 ENABLE=1 MOVE={z2_hedef} SPEED=10 SYNC=0
+    
+    # 5. Yeni konumu tekrar hafızaya yaz!
+    SET_GCODE_VARIABLE MACRO=KAFA_HAFIZA VARIABLE=z2_konum VALUE={z2_hedef}
+    
+    RESPOND MSG="Z2 Yeni Konum -> Z2: {z2_hedef}"
+
+  
+[gcode_macro Z_ONE_UP_ONE]
+description: Korumalı 1mm Yukarı Kaldır
+gcode:
+    {% set z1_mevcut = printer["gcode_macro KAFA_HAFIZA"].z1_konum | float %}
+    
+    {% set z1_hedef = z1_mevcut + 1.0 %}
+    
+    # GÜVENLİK DUVARI (Üst Limit: 82.0)
+    {% if z1_hedef > 82.0 %} {% set z1_hedef = 82.0 %} {% endif %}
+    
+    MANUAL_STEPPER STEPPER=z1 ENABLE=1 MOVE={z1_hedef} SPEED=10 SYNC=0
+    
+    SET_GCODE_VARIABLE MACRO=KAFA_HAFIZA VARIABLE=z1_konum VALUE={z1_hedef}
+    
+    RESPOND MSG="Z1 Yeni Konum -> Z1: {z1_hedef}"
+
+[gcode_macro Z_TWO_UP_ONE]
+description: Korumalı 1mm Yukarı Kaldır
+gcode:
+    {% set z2_mevcut = printer["gcode_macro KAFA_HAFIZA"].z2_konum | float %}
+    
+    {% set z2_hedef = z2_mevcut + 1.0 %}
+    
+    # GÜVENLİK DUVARI (Üst Limit: 82.0)
+    {% if z2_hedef > 82.0 %} {% set z2_hedef = 82.0 %} {% endif %}
+    
+    MANUAL_STEPPER STEPPER=z2 ENABLE=1 MOVE={z2_hedef} SPEED=10 SYNC=0
+    
+    SET_GCODE_VARIABLE MACRO=KAFA_HAFIZA VARIABLE=z2_konum VALUE={z2_hedef}
+    
+    RESPOND MSG="Z2 Yeni Konum -> Z2: {z2_hedef}"
+
+#-------------------------------------------------------------------------------------
+#--------------------------------0.5 MM HAREKET MACROLARI-----------------------------
+#-------------------------------------------------------------------------------------
+
+[gcode_macro Z_ONE_DOWN_DFIVE]
+description: Korumalı 0.5mm Aşağı İndir
+gcode:
+    # 1. Kendi hafızamızdan mevcut konumu çek
+    {% set z1_mevcut = printer["gcode_macro KAFA_HAFIZA"].z1_konum | float %}
+    
+    # 2. Yeni hedefi hesapla (10 mm aşağı)
+    {% set z1_hedef = z1_mevcut - 0.5 %}
+    
+    # 3. GÜVENLİK DUVARI (Alt Limit: 0.0)
+    {% if z1_hedef < 0.0 %} {% set z1_hedef = 0.0 %} {% endif %}
+    
+    # 4. Hareketi Ateşle
+    MANUAL_STEPPER STEPPER=z1 ENABLE=1 MOVE={z1_hedef} SPEED=10 SYNC=0
+    
+    # 5. Yeni konumu tekrar hafızaya yaz!
+    SET_GCODE_VARIABLE MACRO=KAFA_HAFIZA VARIABLE=z1_konum VALUE={z1_hedef}
+    
+    RESPOND MSG="Z1 Yeni Konum -> Z1: {z1_hedef}"
+
+[gcode_macro Z_TWO_DOWN_DFIVE]
+description: Korumalı 0.5mm Aşağı İndir
+gcode:
+    # 1. Kendi hafızamızdan mevcut konumu çek
+    {% set z2_mevcut = printer["gcode_macro KAFA_HAFIZA"].z2_konum | float %}
+    
+    # 2. Yeni hedefi hesapla (10 mm aşağı)
+    {% set z2_hedef = z2_mevcut - 0.5 %}
+    
+    # 3. GÜVENLİK DUVARI (Alt Limit: 0.0)
+    {% if z2_hedef < 0.0 %} {% set z2_hedef = 0.0 %} {% endif %}
+    
+    # 4. Hareketi Ateşle
+    MANUAL_STEPPER STEPPER=z2 ENABLE=1 MOVE={z2_hedef} SPEED=10 SYNC=0
+    
+    # 5. Yeni konumu tekrar hafızaya yaz!
+    SET_GCODE_VARIABLE MACRO=KAFA_HAFIZA VARIABLE=z2_konum VALUE={z2_hedef}
+    
+    RESPOND MSG="Z2 Yeni Konum -> Z2: {z2_hedef}"
+
+  
+[gcode_macro Z_ONE_UP_DFIVE]
+description: Korumalı 0.5mm Yukarı Kaldır
+gcode:
+    {% set z1_mevcut = printer["gcode_macro KAFA_HAFIZA"].z1_konum | float %}
+    
+    {% set z1_hedef = z1_mevcut + 0.5 %}
+    
+    # GÜVENLİK DUVARI (Üst Limit: 82.0)
+    {% if z1_hedef > 82.0 %} {% set z1_hedef = 82.0 %} {% endif %}
+    
+    MANUAL_STEPPER STEPPER=z1 ENABLE=1 MOVE={z1_hedef} SPEED=10 SYNC=0
+    
+    SET_GCODE_VARIABLE MACRO=KAFA_HAFIZA VARIABLE=z1_konum VALUE={z1_hedef}
+    
+    RESPOND MSG="Z1 Yeni Konum -> Z1: {z1_hedef}"
+
+[gcode_macro Z_TWO_UP_DFIVE]
+description: Korumalı 0.5mm Yukarı Kaldır
+gcode:
+    {% set z2_mevcut = printer["gcode_macro KAFA_HAFIZA"].z2_konum | float %}
+    
+    {% set z2_hedef = z2_mevcut + 0.5 %}
+    
+    # GÜVENLİK DUVARI (Üst Limit: 82.0)
+    {% if z2_hedef > 82.0 %} {% set z2_hedef = 82.0 %} {% endif %}
+    
+    MANUAL_STEPPER STEPPER=z2 ENABLE=1 MOVE={z2_hedef} SPEED=10 SYNC=0
+    
+    SET_GCODE_VARIABLE MACRO=KAFA_HAFIZA VARIABLE=z2_konum VALUE={z2_hedef}
+    
+    RESPOND MSG="Z2 Yeni Konum -> Z2: {z2_hedef}"
+
+#-------------------------------------------------------------------------------------
+#--------------------------------0.1 MM HAREKET MACROLARI-----------------------------
+#-------------------------------------------------------------------------------------
+
+[gcode_macro Z_ONE_DOWN_DONE]
+description: Korumalı 0.1mm Aşağı İndir
+gcode:
+    # 1. Kendi hafızamızdan mevcut konumu çek
+    {% set z1_mevcut = printer["gcode_macro KAFA_HAFIZA"].z1_konum | float %}
+    
+    # 2. Yeni hedefi hesapla (10 mm aşağı)
+    {% set z1_hedef = z1_mevcut - 0.1 %}
+    
+    # 3. GÜVENLİK DUVARI (Alt Limit: 0.0)
+    {% if z1_hedef < 0.0 %} {% set z1_hedef = 0.0 %} {% endif %}
+    
+    # 4. Hareketi Ateşle
+    MANUAL_STEPPER STEPPER=z1 ENABLE=1 MOVE={z1_hedef} SPEED=10 SYNC=0
+    
+    # 5. Yeni konumu tekrar hafızaya yaz!
+    SET_GCODE_VARIABLE MACRO=KAFA_HAFIZA VARIABLE=z1_konum VALUE={z1_hedef}
+    
+    RESPOND MSG="Z1 Yeni Konum -> Z1: {z1_hedef}"
+
+[gcode_macro Z_TWO_DOWN_DONE]
+description: Korumalı 0.1mm Aşağı İndir
+gcode:
+    # 1. Kendi hafızamızdan mevcut konumu çek
+    {% set z2_mevcut = printer["gcode_macro KAFA_HAFIZA"].z2_konum | float %}
+    
+    # 2. Yeni hedefi hesapla (10 mm aşağı)
+    {% set z2_hedef = z2_mevcut - 0.1 %}
+    
+    # 3. GÜVENLİK DUVARI (Alt Limit: 0.0)
+    {% if z2_hedef < 0.0 %} {% set z2_hedef = 0.0 %} {% endif %}
+    
+    # 4. Hareketi Ateşle
+    MANUAL_STEPPER STEPPER=z2 ENABLE=1 MOVE={z2_hedef} SPEED=10 SYNC=0
+    
+    # 5. Yeni konumu tekrar hafızaya yaz!
+    SET_GCODE_VARIABLE MACRO=KAFA_HAFIZA VARIABLE=z2_konum VALUE={z2_hedef}
+    
+    RESPOND MSG="Z2 Yeni Konum -> Z2: {z2_hedef}"
+
+  
+[gcode_macro Z_ONE_UP_DONE]
+description: Korumalı 0.1mm Yukarı Kaldır
+gcode:
+    {% set z1_mevcut = printer["gcode_macro KAFA_HAFIZA"].z1_konum | float %}
+    
+    {% set z1_hedef = z1_mevcut + 0.1 %}
+    
+    # GÜVENLİK DUVARI (Üst Limit: 82.0)
+    {% if z1_hedef > 82.0 %} {% set z1_hedef = 82.0 %} {% endif %}
+    
+    MANUAL_STEPPER STEPPER=z1 ENABLE=1 MOVE={z1_hedef} SPEED=10 SYNC=0
+    
+    SET_GCODE_VARIABLE MACRO=KAFA_HAFIZA VARIABLE=z1_konum VALUE={z1_hedef}
+    
+    RESPOND MSG="Z1 Yeni Konum -> Z1: {z1_hedef}"
+
+[gcode_macro Z_TWO_UP_DONE]
+description: Korumalı 0.1mm Yukarı Kaldır
+gcode:
+    {% set z2_mevcut = printer["gcode_macro KAFA_HAFIZA"].z2_konum | float %}
+    
+    {% set z2_hedef = z2_mevcut + 0.1 %}
+    
+    # GÜVENLİK DUVARI (Üst Limit: 82.0)
+    {% if z2_hedef > 82.0 %} {% set z2_hedef = 82.0 %} {% endif %}
+    
+    MANUAL_STEPPER STEPPER=z2 ENABLE=1 MOVE={z2_hedef} SPEED=10 SYNC=0
+    
+    SET_GCODE_VARIABLE MACRO=KAFA_HAFIZA VARIABLE=z2_konum VALUE={z2_hedef}
+    
+    RESPOND MSG="Z2 Yeni Konum -> Z2: {z2_hedef}"
+
+
+#-------------------------------------------------------------------------------------
+#------------------------------------EXTRUDER AYARLARI--------------------------------
+#-------------------------------------------------------------------------------------
+
+[gcode_macro RECINE_HAFIZA]
+variable_recine1_konum: 58.0
+variable_recine2_konum: 58.0
+variable_recine3_konum: 58.0
+gcode:
+
+
+[gcode_macro RECINELERI_SIFIRLA]
+description: DEVRE DISI - recine artik extruder_stepper (makro guncellenmeli)
+gcode:
+    RESPOND MSG="DİKKAT: Recine motorları extruder_stepper yapısına taşındı, bu makro güncellenmeli!"
+    # ====== ESKI GOVDE DEVRE DISI ======
+    # SEBEP: recine_1/2/3 artik [extruder_stepper]; MANUAL_STEPPER ile surulemez -> CRASH.
+    # Makro yeniden yazilana kadar orijinal mantik referans olarak yorumda tutuldu:
+    #   RESPOND MSG="Recine asansorleri tavana cikiyor, operasyon basladi!"
+    #   MANUAL_STEPPER STEPPER=recine_1 SET_POSITION=0
+    #   MANUAL_STEPPER STEPPER=recine_1 MOVE=58 SPEED=5
+    #   MANUAL_STEPPER STEPPER=recine_1 SET_POSITION=58
+    #   MANUAL_STEPPER STEPPER=recine_2 SET_POSITION=0
+    #   MANUAL_STEPPER STEPPER=recine_2 MOVE=58 SPEED=5
+    #   MANUAL_STEPPER STEPPER=recine_2 SET_POSITION=58
+    #   MANUAL_STEPPER STEPPER=recine_3 SET_POSITION=0
+    #   MANUAL_STEPPER STEPPER=recine_3 MOVE=58 SPEED=5
+    #   MANUAL_STEPPER STEPPER=recine_3 SET_POSITION=58
+    #   SET_GCODE_VARIABLE MACRO=RECINE_HAFIZA VARIABLE=recine1_konum VALUE=58.0
+    #   SET_GCODE_VARIABLE MACRO=RECINE_HAFIZA VARIABLE=recine2_konum VALUE=58.0
+    #   SET_GCODE_VARIABLE MACRO=RECINE_HAFIZA VARIABLE=recine3_konum VALUE=58.0
+    #   RESPOND MSG="3 Ekstruder are setted as 58."
+
+#####################################################################
+# 	Printhead (Syringe) Selection — Extruder-Stepper Architecture
+#####################################################################
+# Her makro secili siringayi master [extruder] motion queue'suna SYNC eder ve
+# diger ikisini AYIRIR (MOTION_QUEUE bos). Boylece tek isitici + tek motion
+# queue uzerinden 3 siringa sirayla kullanilir. Her gecis sonrasi G92 E0.
+
+[gcode_macro T0]
+description: Aktif siringa = recine_1
+gcode:
+    SYNC_EXTRUDER_MOTION EXTRUDER=recine_1 MOTION_QUEUE=extruder
+    SYNC_EXTRUDER_MOTION EXTRUDER=recine_2 MOTION_QUEUE=
+    SYNC_EXTRUDER_MOTION EXTRUDER=recine_3 MOTION_QUEUE=
+    G92 E0
+    RESPOND MSG="Aktif kafa: T0 (recine_1)"
+
+[gcode_macro T1]
+description: Aktif siringa = recine_2
+gcode:
+    SYNC_EXTRUDER_MOTION EXTRUDER=recine_2 MOTION_QUEUE=extruder
+    SYNC_EXTRUDER_MOTION EXTRUDER=recine_1 MOTION_QUEUE=
+    SYNC_EXTRUDER_MOTION EXTRUDER=recine_3 MOTION_QUEUE=
+    G92 E0
+    RESPOND MSG="Aktif kafa: T1 (recine_2)"
+
+[gcode_macro T2]
+description: Aktif siringa = recine_3
+gcode:
+    SYNC_EXTRUDER_MOTION EXTRUDER=recine_3 MOTION_QUEUE=extruder
+    SYNC_EXTRUDER_MOTION EXTRUDER=recine_1 MOTION_QUEUE=
+    SYNC_EXTRUDER_MOTION EXTRUDER=recine_2 MOTION_QUEUE=
+    G92 E0
+    RESPOND MSG="Aktif kafa: T2 (recine_3)"
