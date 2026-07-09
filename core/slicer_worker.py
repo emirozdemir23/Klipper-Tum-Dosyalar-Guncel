@@ -264,12 +264,33 @@ class SliceWorker(QObject):
     finished = pyqtSignal(list, list, list, object)  # (slices, layer_meshes, infills, centered_original_mesh)
     error    = pyqtSignal(str)
     progress = pyqtSignal(int)                        # 0..100 for the UI progress bar
+    aborted  = pyqtSignal()                           # cooperative cancel acknowledged
 
     def __init__(self, stl_path: str, layer_h: float, distance: float) -> None:
         super().__init__()
         self._stl_path = stl_path
         self._layer_h  = layer_h
         self._distance = distance
+        self._abort    = False
+
+    def request_abort(self) -> None:
+        """GUI thread'inden cagrilir: ISBIRLIKCI iptal (GIL-atomik bool set).
+
+        run() bayragi blok sinirlarinda ve infill dongusunun her adiminda yoklar;
+        gorunce finished/error YERINE ``aborted`` emit edip milisaniyeler icinde
+        doner. Boylece kapanista/model degisiminde QThread.terminate() (RPi4'te
+        yarim VTK durumu + kilitli GIL riski) son care olmaktan cikar.
+        """
+        self._abort = True
+
+    def _abort_requested(self) -> bool:
+        """True donerse cagiran HEMEN return etmeli; aborted sinyali atilmistir."""
+        if not self._abort:
+            return False
+        print("[SLICE-PROF] === ABORTED (iptal istegi goruldu, temiz cikis) ===",
+              flush=True)
+        self.aborted.emit()
+        return True
 
     def run(self) -> None:
         # ───────────────────────── PROFILING ─────────────────────────
@@ -319,6 +340,8 @@ class SliceWorker(QObject):
                 n_cells0 = 0
             print(f"[SLICE-PROF] read+combine: {time.perf_counter()-t0:.3f}s ({n_cells0} cells)", flush=True)
             self.progress.emit(5)
+            if self._abort_requested():
+                return
 
             # --- DECIMATION (decimate_pro → decimate() fallback) ---
             t0 = time.perf_counter()
@@ -342,6 +365,8 @@ class SliceWorker(QObject):
                       f"({n_cells0} -> {mesh.n_cells} cells, target={target:.2f})", flush=True)
             else:
                 print(f"[SLICE-PROF] decimate: skipped ({n_cells0} <= {DECIMATE_FACE_THRESHOLD})", flush=True)
+            if self._abort_requested():
+                return
 
             # --- CENTER + ghost deep-copy ---
             t0 = time.perf_counter()
@@ -386,12 +411,21 @@ class SliceWorker(QObject):
                 return
             print(f"[SLICE-PROF] contour ({n_layers} layers): {time.perf_counter()-t0:.3f}s", flush=True)
             self.progress.emit(30)
+            if self._abort_requested():
+                return
 
             # --- BUCKET into per-layer PolyData ---
             t0 = time.perf_counter()
             per_layer = _bucket_contours_by_layer(contours, z_mids)
+            # RPi4 (2 GB): kombine kontur TUM katmanlarin nokta/segment kopyasini
+            # tutar; bucket'lar kendi kopyalarini cikardi (fancy indexing) → artik
+            # gereksiz. Infill dongusu boyunca on MB'larca fazladan tutmamak icin
+            # burada birak.
+            del contours
             print(f"[SLICE-PROF] bucket: {time.perf_counter()-t0:.3f}s", flush=True)
             self.progress.emit(40)
+            if self._abort_requested():
+                return
 
             # --- MASTER GRID positions (built ONCE) ---
             t0 = time.perf_counter()
@@ -409,6 +443,8 @@ class SliceWorker(QObject):
             infills = []
             last_pct = 50  # emit only when the integer % changes (avoid signal flood)
             for i in range(n_layers):
+                if self._abort_requested():   # ucuz bool kontrolu, her katmanda
+                    return
                 slc = per_layer[i]
                 slices.append(slc)
                 layer_meshes.append(slc)   # gate-only, never mutated → share
@@ -426,9 +462,15 @@ class SliceWorker(QObject):
                     last_pct = pct
             print(f"[SLICE-PROF] infill loop ({n_layers} layers): {time.perf_counter()-t0:.3f}s", flush=True)
 
+            if self._abort_requested():   # son kontrol: iptal edilen is finished ATMAZ
+                return
             print(f"[SLICE-PROF] === TOTAL run(): {time.perf_counter()-t_start:.3f}s "
                   f"for {n_layers} layers ===", flush=True)
             self.progress.emit(100)
             self.finished.emit(slices, layer_meshes, infills, centered_original_mesh)
         except Exception as exc:
-            self.error.emit(str(exc))
+            # Konsola tam traceback (teshis icin), GUI'ye tip adiyla kisa mesaj —
+            # str(exc) bos olabilen numpy/VTK hatalarinda bos dialog cikmasin.
+            import traceback
+            traceback.print_exc()
+            self.error.emit(f"{type(exc).__name__}: {exc}")
