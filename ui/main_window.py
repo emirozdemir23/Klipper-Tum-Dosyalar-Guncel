@@ -1588,6 +1588,35 @@ class KlipperArayuzu(QWidget):
             except Exception:
                 pass
 
+    def _add_model_view_actor(self, mesh, actor_name: str):
+        """Model sekmesindeki STL kopyalarini ESKI PARLAK malzemeyle ekler.
+
+        Kok neden: 3ad18bd'deki orijinal parlak model ayarlari
+        (ambient=0.6 / diffuse=0.7 / specular=0.20 / specular_power=32,
+        smooth_shading=False) c00a616'da tek-model -> coklu-kopyaya gecerken
+        DUSMUS; bare add_mesh(lighting=True) PyVista varsayilanlariyla (ambient~0,
+        specular~0) golgeli yuzleri karartip mat/lacivert gorunume yol acmisti.
+        Bu helper o ISPATLANMIS ayarlari AYNEN geri getirir. YALNIZCA Model
+        sekmesi STL kopyalari icin; Preview aktorleri (_add_filament) KULLANMAZ.
+        Tum kopyalar pickable=False (salt-goruntuleme). render=False -> cagiran
+        tek render yapar. Global isik/plotter'a DOKUNMAZ (actor-level malzeme).
+        """
+        self.plotter.add_mesh(
+            mesh,
+            name=actor_name,
+            color="#29b6f6",
+            show_edges=False,
+            edge_color="#01579b",
+            lighting=True,
+            smooth_shading=False,
+            specular=0.20,
+            specular_power=32,
+            ambient=0.6,
+            diffuse=0.7,
+            pickable=False,
+            render=False,
+        )
+
     def _update_model_copies(self) -> None:
         """Yuklenmis modeli aktif platforma gore Model sekmesinde kopyalar.
 
@@ -1621,9 +1650,7 @@ class KlipperArayuzu(QWidget):
         kind_id = self.bp_buton_grubu.checkedId() if self.bp_buton_grubu else 0
         if kind_id != 1:
             # Petri / Glass -> tek kopya, yatak merkezinde (deep-copy gereksiz).
-            self.plotter.add_mesh(mesh, color="#29b6f6", show_edges=False,
-                                  lighting=True, name="model_copy_center",
-                                  pickable=False, render=False)
+            self._add_model_view_actor(mesh, "model_copy_center")
             self._well_model_actor_names.append("model_copy_center")
         else:
             # Well Plate -> secili her gecerli kuyu icin bir kopya, kuyu merkezinde.
@@ -1635,9 +1662,7 @@ class KlipperArayuzu(QWidget):
                 mesh_copy = mesh.copy(deep=True)
                 mesh_copy.translate((cx, cy, 0.0), inplace=True)
                 actor_name = f"model_copy_{well_id}"
-                self.plotter.add_mesh(mesh_copy, color="#29b6f6", show_edges=False,
-                                      lighting=True, name=actor_name,
-                                      pickable=False, render=False)
+                self._add_model_view_actor(mesh_copy, actor_name)
                 self._well_model_actor_names.append(actor_name)
         try:
             self.plotter.render()
