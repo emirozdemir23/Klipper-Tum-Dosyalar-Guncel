@@ -36,7 +36,38 @@ def _configure_opengl() -> None:
     QSurfaceFormat.setDefaultFormat(fmt)
 
 
+def _install_excepthook() -> None:
+    """R6: Global istisna korumasi — kiosk'un tek noktadan olumunu engeller.
+
+    PyQt6, bir slot/callback icindeki yakalanmamis Python istisnasinda
+    sys.excepthook VARSAYILAN hook ise qFatal() ile TUM sureci abort eder
+    (kiosk aninda olur). OZEL bir hook kuruluysa PyQt yalnizca hook'u cagirir
+    ve uygulama YASAMAYA devam eder. Bu hook traceback'i stderr'e ve proje
+    kokundeki crash.log'a yazar. BILEREK hicbir dialog/pencere ACMAZ: kiosk'ta
+    modal = kilit riski ve istisna aninda GUI durumu belirsiz olabilir.
+    """
+    import traceback
+    from datetime import datetime
+    from pathlib import Path
+
+    log_path = Path(__file__).resolve().parent / "crash.log"
+
+    def _hook(exc_type, exc_value, exc_tb) -> None:
+        text = "".join(traceback.format_exception(exc_type, exc_value, exc_tb))
+        print(f"[GUARD] Yakalanmamis istisna (uygulama yasatildi):\n{text}",
+              file=sys.stderr)
+        try:
+            with open(log_path, "a", encoding="utf-8") as fh:
+                fh.write(f"\n--- {datetime.now().isoformat(timespec='seconds')} ---\n")
+                fh.write(text)
+        except OSError:
+            pass   # disk dolu/salt-okunur: loglama ugruna asla cokme
+
+    sys.excepthook = _hook
+
+
 def main() -> int:
+    _install_excepthook()   # R6: slot istisnalari artik qFatal/abort ETMEZ
     _configure_opengl()
     try:
         import vtk
@@ -49,7 +80,10 @@ def main() -> int:
 
     app = QApplication(sys.argv)
     window = KlipperArayuzu()
-    window.show()
+    # KIOSK MODE: 800x480 RPi dokunmatik ekranda tam ekran baslat.
+    # PC'de test icin: Esc -> tam ekrandan cik, F11 -> toggle (bkz. keyPressEvent).
+    # Tam ekranda mahsur kalmamak icin Ayarlar sekmesinde "Exit Application" butonu var.
+    window.showFullScreen()
     return app.exec()
 
 

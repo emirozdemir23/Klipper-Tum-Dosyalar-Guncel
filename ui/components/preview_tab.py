@@ -63,11 +63,13 @@ class PreviewTab(QWidget):
         self.layer_slider.setMinimum(0)
         self.layer_slider.setMaximum(0)
         self.layer_slider.setValue(0)
-        # Qt's vertical slider defaults to max-at-bottom (dragging up lowers the
-        # value). Invert BOTH appearance and controls so Layer 1 sits at the
+        # NOTE: Qt's VERTICAL QSlider default is ALREADY min-at-bottom /
+        # max-at-top (dragging UP increases the value). The previous explicit
+        # setInvertedAppearance(True) was what flipped this slider upside down
+        # (value grew top-to-bottom). Keep BOTH False: Layer 1 sits at the
         # BOTTOM and dragging/scrolling UP INCREASES the layer — like Cura.
-        self.layer_slider.setInvertedAppearance(True)
-        self.layer_slider.setInvertedControls(True)
+        self.layer_slider.setInvertedAppearance(False)
+        self.layer_slider.setInvertedControls(False)
         self.layer_slider.setStyleSheet(
             "QSlider::groove:vertical {"
             "  width:6px; background:#E0E0E0; border-radius:3px;"
