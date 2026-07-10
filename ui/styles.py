@@ -95,3 +95,45 @@ TEXTAREA_STYLE: str = """
         border: 1px solid #CFD8DC; border-radius: 4px; padding: 15px;
     }
 """
+
+# Diyalog pencereleri icin global QSS (dokunmatik-okunur). App-genelinde verilir.
+# GUVENLIK: Tum seciciler QDialog / QMessageBox / QInputDialog (ve alt siniflari)
+# ile baslar. Ana pencere KlipperArayuzu bir QWidget'tir (QDialog DEGIL), bu yuzden
+# bu kurallar ana arayuzdeki hicbir buton/etiket ile ESLESMEZ -> tasarim korunur.
+DIALOG_STYLE: str = """
+    QMessageBox, QInputDialog {
+        min-width: 380px;
+        background-color: #F8F9FA;
+    }
+    QMessageBox QLabel, QInputDialog QLabel {
+        font-size: 16px;
+        color: #212121;
+    }
+    QInputDialog QLineEdit, QMessageBox QLineEdit {
+        font-size: 16px;
+        min-height: 30px;
+        padding: 4px 8px;
+        background-color: #FFFFFF; color: #212121;
+        border: 1px solid #CFD8DC; border-radius: 4px;
+    }
+    QMessageBox QPushButton,
+    QInputDialog QPushButton,
+    QDialog QDialogButtonBox QPushButton {
+        font-size: 14px;
+        min-height: 35px;
+        min-width: 90px;
+        padding: 6px 18px;
+        background-color: #F0F2F5; color: #212121;
+        border: 1px solid #CFD8DC; border-radius: 6px;
+    }
+    QMessageBox QPushButton:hover,
+    QInputDialog QPushButton:hover,
+    QDialog QDialogButtonBox QPushButton:hover {
+        background-color: #1976D2; color: #FFFFFF; border-color: #1565C0;
+    }
+    QMessageBox QPushButton:pressed,
+    QInputDialog QPushButton:pressed,
+    QDialog QDialogButtonBox QPushButton:pressed {
+        background-color: #1565C0; color: #FFFFFF;
+    }
+"""

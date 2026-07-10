@@ -83,7 +83,10 @@ class SettingsTab(QWidget):
         f1.setContentsMargins(15, 12, 15, 12)
 
         self.kutu_layer = self._create_spinbox(f1, "Layer Thickness", 0.05, 2.0, 2, 0.01, " mm", 0.2)
-        self.kutu_speed = self._create_spinbox(f1, "Print Speed", 1, 60, 0, 1, " mm/s", 10)
+        # Ust sinir 30 mm/s: klipper.txt [printer] max_velocity: 30 (4mm/tur Z
+        # vidali mil gercegi). 60'a izin vermek yaniltici olurdu — Klipper zaten
+        # 30'da kirpar; dosyadaki F degeri makinenin yapabildigiyle eslessin.
+        self.kutu_speed = self._create_spinbox(f1, "Print Speed", 1, 30, 0, 1, " mm/s", 10)
 
         lbl_grid = QLabel("Grid Type")
         lbl_grid.setStyleSheet(LABEL_STYLE)
@@ -109,6 +112,13 @@ class SettingsTab(QWidget):
 
         self.kutu_ph_temp = self._create_spinbox(f2, "Printhead Temperature", 4, 45, 0, 1, " °C", 27.0)
         self.kutu_plat_temp = self._create_spinbox(f2, "Platform Temperature", -30.0, 40, 0, 1, " °C", -30.0)
+        # R7: Bu iki kutu HER valueChanged'de canli SET_HEATER_TEMPERATURE /
+        # SET_TEMPERATURE_FAN_TARGET gonderir (main_window baglar). Varsayilan
+        # keyboardTracking=True ile "37" yazarken once TARGET=3.0 giderdi —
+        # canli peltier'e GECICI YANLIS hedef. False: deger yalnizca Enter /
+        # odak kaybi / ok tuslarinda commit edilir (tus basina POST da biter).
+        self.kutu_ph_temp.setKeyboardTracking(False)
+        self.kutu_plat_temp.setKeyboardTracking(False)
         sol.addWidget(g2)
 
         # --- Build Platform Info (Kompakt) ---
@@ -183,6 +193,23 @@ class SettingsTab(QWidget):
         sol.addSpacing(8)
         sol.addWidget(self.slice_progress)
         sol.addStretch()
+
+        # --- Exit Application (Kiosk modu: tam ekrandan OS'e don) ---
+        # Kirmizi/dikkat cekici. Davranis controller'da baglanir (view-only kurali).
+        exit_row = QHBoxLayout()
+        self.exit_app_btn = QPushButton("Exit Application")
+        self.exit_app_btn.setFixedHeight(40)
+        self.exit_app_btn.setStyleSheet("""
+            QPushButton {
+                font-size:15px; font-weight:bold; padding:8px 24px;
+                background:#D32F2F; color:white; border-radius:5px; border:none;
+            }
+            QPushButton:hover  { background:#C62828; }
+            QPushButton:pressed{ background:#B71C1C; }
+        """)
+        exit_row.addWidget(self.exit_app_btn)
+        exit_row.addStretch()
+        sol.addLayout(exit_row)
 
         main.addLayout(sol, 1)
 
