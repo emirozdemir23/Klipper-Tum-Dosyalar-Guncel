@@ -89,6 +89,30 @@ CONTAINER_DEFAULTS = {
 }
 
 
+def well_centers(fmt: int) -> dict:
+    """well_id -> (cx, cy) for a well-plate format, from CONTAINER_DEFAULTS.
+
+    Pure data (NO plotter, NO actors): lets Preview + G-code export learn each
+    well's bed-local center WITHOUT the Model tab drawing an interactive well
+    container. Uses the exact same symmetric-layout math as
+    ``build_container_reference`` so both agree on well positions.
+    """
+    cfg = CONTAINER_DEFAULTS["well"]
+    wc = cfg.get(int(fmt))
+    if wc is None:
+        return {}
+    px, py = wc["pitch"]
+    rows, cols = wc["rows"], wc["cols"]
+    row_labels = [chr(ord("A") + i) for i in range(rows)]
+    out = {}
+    for row in range(rows):
+        cy = ((rows - 1) / 2.0 - row) * py       # A(+Y ust) -> son satir(-Y alt)
+        for col in range(cols):
+            cx = (col - (cols - 1) / 2.0) * px   # sutun 1(-X) -> N(+X)
+            out[f"{row_labels[row]}{col + 1}"] = (cx, cy)
+    return out
+
+
 def _ring(cx, cy, z, r, n=72):
     """(cx,cy) merkezli, z yuksekliginde, r yaricapli kapali cember (cizgiler)."""
     t = np.linspace(0.0, 2.0 * np.pi, n, endpoint=False)

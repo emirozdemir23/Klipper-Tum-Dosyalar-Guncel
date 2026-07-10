@@ -24,14 +24,22 @@ class PlatformTab(QWidget):
     # Payload ornegi: {"type":"well_plate","well_format":6,"selected_wells":["A1",...]}
     platform_changed = pyqtSignal(dict)
 
-    # Kuyu butonu stili: secili = dolu acik mavi, bos = beyaz + mavi kenarlik.
-    # :checked pseudo-state programatik setChecked'te de otomatik uygulanir.
-    _WELL_BTN_STYLE = """
-        QPushButton { background:#FFFFFF; color:#1565C0; border:2px solid #1E88E5;
-                      border-radius:6px; font-size:14px; font-weight:bold; }
-        QPushButton:hover   { background:#E3F2FD; }
-        QPushButton:checked { background:#4FC3F7; color:#FFFFFF; border:2px solid #0277BD; }
-    """
+    @staticmethod
+    def _well_btn_style(sz: int) -> str:
+        """DAIRESEL kuyu butonu QSS: width==height==sz, border-radius=sz/2 -> tam cember.
+
+        Gercek laboratuvar well-plate hissi: secili = dolu acik mavi, bos = beyaz +
+        mavi cerceve. :checked pseudo-state programatik setChecked'te de uygulanir.
+        border-radius kuyu capina (sz) bagli oldugundan buton-basi uretilir.
+        """
+        r = sz // 2
+        fs = 15 if sz >= 50 else 12
+        return (
+            f"QPushButton {{ background:#FFFFFF; color:#1565C0; border:2px solid #1E88E5;"
+            f"              border-radius:{r}px; font-size:{fs}px; font-weight:bold; }}"
+            f"QPushButton:hover   {{ background:#E3F2FD; }}"
+            f"QPushButton:checked {{ background:#4FC3F7; color:#FFFFFF; border:2px solid #0277BD; }}"
+        )
 
     def __init__(self, parent: QWidget | None = None) -> None:
         super().__init__(parent)
@@ -110,12 +118,16 @@ class PlatformTab(QWidget):
         lw = QVBoxLayout(p_well)
         lw.setAlignment(Qt.AlignmentFlag.AlignCenter)
 
-        # Well shape container - içinde grid dinamik değişecek
+        # Well shape container - içinde grid dinamik değişecek.
+        # Acik gri "plaka" zemin + yuvarlak kose: dairesel kuyular bir well-plate
+        # yuzeyine oturmus gibi gorunsun (QFrame'e scope'lu -> cocuklara sizmaz).
         self.well_shape_container = QFrame()
-        self.well_shape_container.setStyleSheet("border:4px solid #64B5F6; border-radius:10px; background:transparent;")
+        self.well_shape_container.setStyleSheet(
+            "QFrame { border:3px solid #90CAF9; border-radius:16px; background:#EEF5FC; }")
         self.well_grid_layout = QGridLayout(self.well_shape_container)
         self.well_grid_layout.setAlignment(Qt.AlignmentFlag.AlignCenter)
-        self.well_grid_layout.setSpacing(10)
+        self.well_grid_layout.setContentsMargins(18, 18, 18, 18)
+        self.well_grid_layout.setSpacing(14)
 
         lw.addWidget(self.well_shape_container, alignment=Qt.AlignmentFlag.AlignCenter)
         lw.addSpacing(30)
@@ -152,13 +164,10 @@ class PlatformTab(QWidget):
         well_btn_row.addWidget(self.btn_12)
         lw.addLayout(well_btn_row)
 
-        # Secili kuyular bilgi etiketi ("None" ya da "A1, A2, ...").
-        lw.addSpacing(15)
-        self.selected_wells_lbl = QLabel("Selected wells: None")
-        self.selected_wells_lbl.setWordWrap(True)
-        self.selected_wells_lbl.setStyleSheet(
-            "font-size:15px; color:#1565C0; font-weight:bold;")
-        lw.addWidget(self.selected_wells_lbl, alignment=Qt.AlignmentFlag.AlignCenter)
+        # NOT: "Selected wells: ..." bilgi etiketi UI'dan KALDIRILDI (kullanici
+        # istegi). selected_wells state'i arka planda AYNEN yasar (preview / export
+        # / print bu state'i kullanmaya devam eder); yalnizca gorsel etiket yok.
+        # _update_selected_wells_label() bu yuzden getattr ile guvenli no-op kalir.
 
         self.bp_stacked.addWidget(p_well)
 
@@ -298,16 +307,20 @@ class PlatformTab(QWidget):
                 btn = QPushButton(wid)
                 btn.setCheckable(True)
                 btn.setFixedSize(sz, sz)
-                btn.setStyleSheet(self._WELL_BTN_STYLE)
+                btn.setStyleSheet(self._well_btn_style(sz))
                 btn.toggled.connect(
                     lambda checked, w=wid: self._on_well_button_toggled(w, checked))
                 self.well_grid_layout.addWidget(btn, row_idx, col,
                                                 alignment=Qt.AlignmentFlag.AlignCenter)
                 self.well_buttons[wid] = btn
 
-        # Container boyutunu ayarla
-        total_width = cols * (sz + 10) + 40
-        total_height = len(rows) * (sz + 10) + 40
+        # Container (plaka) boyutu: kenar bosluklari (mrg) + satir/sutun basligi
+        # payi (hdr) + dairesel kuyular (sz) + aralarindaki grid bosluklari (spc).
+        # Bu degerler yukaridaki setContentsMargins(18)/setSpacing(14) ile eslesir;
+        # hafif bollugu AlignCenter merkezler, cemberler kirpilmaz.
+        mrg, spc, hdr = 18, 14, 24
+        total_width = 2 * mrg + hdr + cols * sz + cols * spc
+        total_height = 2 * mrg + hdr + len(rows) * sz + len(rows) * spc
         self.well_shape_container.setFixedSize(total_width, total_height)
         self._update_selected_wells_label()
 
