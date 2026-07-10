@@ -1,3 +1,15 @@
 .claude/
 __pycache__/
 *.bak
+
+# Runtime data (user protocols) — generated at runtime, not source
+data/protocols/
+
+# Agent/skill scratch folders
+/buyuk-olcekli-duzenleme-disiplini/
+/kok-neden-analizi-ve-loglama/
+/token-tasarrufu-ve-kisa-yanit/
+
+# Crash log and temp files
+crash.log
+*.tmp
