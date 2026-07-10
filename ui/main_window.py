@@ -992,9 +992,11 @@ class KlipperArayuzu(QWidget):
         wells = d.get("bp_selected_wells", [])
         self.platform_tab.set_selected_wells(wells, emit_signal=False)
         self._selected_wells = set(wells)
-        # Preview/export icin kuyu merkezlerini tazele (cizim YOK). Model sahnesi
-        # salt-goruntuleme oldugundan tek modeli merkeze tazeler (plotter yoksa no-op).
+        # Preview/export icin merkezleri tazele; sonra Model sahnesinde referans
+        # kabi (salt-gorsel) + secili kuyulara model kopyalarini tazele
+        # (plotter yoksa hepsi no-op).
         self._rebuild_well_registry()
+        self._draw_container()
         self._update_model_copies()
 
         self._update_platform_info()
@@ -1481,34 +1483,40 @@ class KlipperArayuzu(QWidget):
         return None
 
     def _draw_container(self) -> None:
-        """Secili referans kabini Model viewport'una wireframe olarak yeniden ciz.
+        """Model viewport'una REFERANS kap geometrisini (petri/glass/well) cizer.
 
-        Well plate'de footprint ayri aktor, her kuyu ayri wireframe + saydam hitbox
-        (pickable) olarak cizilir; _well_registry kuyu->aktor eslemesini tutar.
-        Model henuz yuklenmemisse (plotter yok) sessizce gecer.
+        SALT-GORSEL: create_hitboxes=False -> hicbir pickable hitbox uretilmez,
+        mesh-picking YOK, tiklama ile ekleme/silme YOK. Amac yalnizca modellerin
+        HANGI kuyularda oldugunu gostermek (footprint + kuyu wireframe'leri).
+        Kuyu-merkez registry'si burada DEGIL, _rebuild_well_registry() icinde
+        (veriden) kurulur. Model henuz yuklenmemisse (plotter yok) sessizce gecer.
         """
         if pv is None or getattr(self, "plotter", None) is None:
             return
-        # Onceki kap aktorlerini (footprint + tum kuyular + hitbox'lar) temizle.
+        # Onceki kap aktorlerini (footprint + tum kuyu wireframe'leri) temizle.
         for nm in getattr(self, "_container_actor_names", []):
             try:
                 self.plotter.remove_actor(nm, render=False)
             except Exception:
                 pass
         self._container_actor_names = []
-        self._well_registry = {}
         spec = self._current_container_spec()
         try:
             if spec is not None:
-                result = build_container_reference(self.plotter, spec)
+                # create_hitboxes=False -> yalnizca gorunur wireframe; pickable YOK.
+                result = build_container_reference(self.plotter, spec,
+                                                   create_hitboxes=False)
                 self._container_actor_names = result.get("actor_names", [])
-                self._well_registry = result.get("wells", {})
-            # Format degisince gecersiz kalan kuyu secimlerini ayikla (guvenlik agi;
-            # normal akista PlatformTab zaten temizler).
-            if self._well_registry:
-                self._selected_wells &= set(self._well_registry.keys())
-            # Yeni kurulan kuyulara secim renklerini uygula.
-            self._apply_well_selection_colors(render=False)
+            # Kap imzasini CIZILEN spec'ten kur; boylece _on_platform_config_changed
+            # ayni type/format icin gereksiz yeniden cizim yapmaz (RPi4).
+            if not spec:
+                self._container_signature = (None,)
+            elif spec.get("kind") == "well":
+                self._container_signature = ("well", spec.get("format"))
+            elif spec.get("kind") == "glass":
+                self._container_signature = ("glass", spec.get("x"), spec.get("y"))
+            else:
+                self._container_signature = ("petri", spec.get("diameter"))
             self.plotter.render()
         except Exception as e:
             print(f"[container] cizim hatasi: {e}")
@@ -1535,17 +1543,23 @@ class KlipperArayuzu(QWidget):
     # PLATFORM CONFIG (PlatformTab.platform_changed alicisi)
     # ==========================================================
     def _on_platform_config_changed(self, config: dict) -> None:
-        """PlatformTab secim/format/tip degisimini merkezi state'e yansitir.
-
-        Model sekmesi SALT-GORUNTULEME oldugundan burada 3D model sahnesi
-        DEGISTIRILMEZ (kuyu secimi modeli kopyalamaz/silmez). Yalnizca:
-          * _selected_wells merkezi state'i (Preview + export kaynagi) guncellenir,
-          * kuyu-merkez registry'si veriden yeniden kurulur (cizim YOK),
-          * Settings build-platform bilgi etiketi tazelenir.
+        """PlatformTab secim/format/tip degisimini merkezi state'e + Model sahnesine
+        yansitir. Kuyu seciminin TEK kaynagi PlatformTab'dir (Model sekmesinde
+        tiklama secim degistirmez). Sira:
+          1) _selected_wells merkezi state'i (Preview + export kaynagi) guncellenir,
+          2) kuyu-merkez registry'si veriden yeniden kurulur (Preview/export icin),
+          3) kap REFERANS geometrisi YALNIZCA type/format degisince yeniden cizilir
+             (RPi4: her kuyu tiklamasi tum kap aktorlerini yeniden kurmasin),
+          4) model kopyalari HER secim degisiminde tazelenir (secili kuyu = 1 kopya),
+          5) Settings build-platform bilgi etiketi tazelenir.
         """
         self.platform_config = config or {}
         self._selected_wells = set(self.platform_config.get("selected_wells", []))
-        self._rebuild_well_registry()   # Preview/export icin merkezler (cizim YOK)
+        self._rebuild_well_registry()
+        sig = self._container_signature_of(self.platform_config)
+        if sig != self._container_signature:
+            self._draw_container()          # _container_signature'i gunceller
+        self._update_model_copies()         # secili her kuyuya bir kopya
         self._update_platform_info()
 
     @staticmethod
@@ -1575,17 +1589,21 @@ class KlipperArayuzu(QWidget):
                 pass
 
     def _update_model_copies(self) -> None:
-        """Model sekmesi SALT-GORUNTULEME: yatak merkezinde HER ZAMAN TEK model.
+        """Yuklenmis modeli aktif platforma gore Model sekmesinde kopyalar.
 
-        Eski davranis (well-plate'te secili her kuyuya bir kopya, kuyu tiklayinca
-        ekle/sil) KALDIRILDI; kuyu secimi artik model sahnesini degistirmez.
-        Coklu-kuyu cogaltimi yalnizca Preview (_local_preview_origins) ve
-        G-code export (generate_gcode_multi_origin) tarafinda yasar.
+        - Petri / Glass  -> tek kopya, yatak merkezinde (ad: model_copy_center).
+        - Well Plate     -> Built Platform'da secili HER gecerli kuyu icin bir
+                            deep-copy; kuyu merkezine (cx,cy,0) translate edilir
+                            (ad: model_copy_<well_id>). Secili kuyu YOKSA kopya yok.
+        Kopya sayisi = secili kuyu sayisi. TUM kopyalar pickable=False (Model
+        sekmesi salt-goruntuleme; tiklama ile ekleme/silme YOK). Coklu-kuyu
+        cogaltimi ayrica Preview + generate_gcode_multi_origin tarafinda yasar.
+        Kuyu SECIMININ TEK kaynagi PlatformTab.selected_wells'tir.
         """
         if pv is None or getattr(self, "plotter", None) is None:
             return
-        # Onceki model aktorunu temizle.
-        for nm in self._well_model_actor_names:
+        # Onceki model kopyalarini temizle.
+        for nm in list(self._well_model_actor_names):
             try:
                 self.plotter.remove_actor(nm, render=False)
             except Exception:
@@ -1600,11 +1618,27 @@ class KlipperArayuzu(QWidget):
                 pass
             return
 
-        # Tek model, yatak merkezinde (0,0) — deep-copy gereksiz (RPi4 bellek).
-        self.plotter.add_mesh(mesh, color="#29b6f6", show_edges=False,
-                              lighting=True, name="model_single",
-                              pickable=False, render=False)
-        self._well_model_actor_names = ["model_single"]
+        kind_id = self.bp_buton_grubu.checkedId() if self.bp_buton_grubu else 0
+        if kind_id != 1:
+            # Petri / Glass -> tek kopya, yatak merkezinde (deep-copy gereksiz).
+            self.plotter.add_mesh(mesh, color="#29b6f6", show_edges=False,
+                                  lighting=True, name="model_copy_center",
+                                  pickable=False, render=False)
+            self._well_model_actor_names.append("model_copy_center")
+        else:
+            # Well Plate -> secili her gecerli kuyu icin bir kopya, kuyu merkezinde.
+            for well_id in sorted(self._selected_wells):
+                info = self._well_registry.get(well_id)
+                if not info:
+                    continue
+                cx, cy = info["center"]
+                mesh_copy = mesh.copy(deep=True)
+                mesh_copy.translate((cx, cy, 0.0), inplace=True)
+                actor_name = f"model_copy_{well_id}"
+                self.plotter.add_mesh(mesh_copy, color="#29b6f6", show_edges=False,
+                                      lighting=True, name=actor_name,
+                                      pickable=False, render=False)
+                self._well_model_actor_names.append(actor_name)
         try:
             self.plotter.render()
         except Exception:
@@ -1736,13 +1770,15 @@ class KlipperArayuzu(QWidget):
             self._loaded_model_mesh = mesh
             self._model_actor = None
 
-            # --- KUYU MERKEZ KAYDI (SADECE VERI; sahneye HICBIR SEY cizmez) ---
-            # Model sekmesi salt-goruntuleme oldugundan referans kap / kuyu
-            # wireframe / hitbox CIZILMEZ. Ama Preview + G-code export'un kuyu
-            # merkezlerini bilmesi gerekir -> registry'yi veriden kurar.
+            # --- KUYU MERKEZ KAYDI (Preview/export icin; SADECE VERI) ---
             self._rebuild_well_registry()
 
-            # --- MODEL --- Salt-goruntuleme: yatak merkezinde TEK model.
+            # --- REFERANS KAP (SALT-GORSEL: hitbox YOK, mesh-picking YOK) ---
+            # Modellerin hangi kuyularda oldugu gorunsun diye footprint + kuyu
+            # wireframe'leri cizilir; hicbir aktor pickable degildir.
+            self._draw_container()
+
+            # --- MODEL KOPYALARI (petri/glass=merkez; well-plate=secili kuyular) ---
             self._update_model_copies()
 
             # --- AYDINLATMA ---

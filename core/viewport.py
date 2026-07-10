@@ -137,7 +137,7 @@ def _box_edges(x0, x1, y0, y1, z0, z1):
 
 def build_container_reference(plotter, spec, name="container_ref",
                               color="#F4511E", line_width=2.0,
-                              hitbox_opacity=0.05):
+                              hitbox_opacity=0.05, create_hitboxes=True):
     """Secilen referans kabini (spec) wireframe named-actor olarak cizer.
 
     Hizalama (HEPSI yatagin tam ortasinda):
@@ -149,10 +149,15 @@ def build_container_reference(plotter, spec, name="container_ref",
       {"kind":"glass","x":20.0,"y":60.0,"height":2.0}
       {"kind":"well","format":6}
 
+    create_hitboxes:
+      * True  (varsayilan) -> her kuyuya saydam dolu silindir "hitbox"
+        (pickable=True, ad="well_hit_<id>") tiklama hedefi olarak eklenir.
+      * False -> SALT-GORSEL: hitbox URETILMEZ, hicbir pickable aktor eklenmez.
+        Model sekmesi bunu kullanir (click-to-add/remove KESINLIKLE olmasin).
+
     Donus: {"actor_names":[...], "wells":{well_id:{"center":(cx,cy),"wire":actor}}}.
-    Well plate'de footprint + her kuyu AYRI aktor; her kuyuya saydam dolu silindir
-    "hitbox" (pickable=True, ad="well_hit_<id>") tiklama hedefi olarak eklenir.
-    Wireframe/footprint/diger her sey pickable=False.
+    Well plate'de footprint + her kuyu AYRI wireframe aktor. Wireframe/footprint/
+    diger her sey pickable=False; yalnizca (create_hitboxes ise) hitbox pickable.
     """
     empty = {"actor_names": [], "wells": {}}
     if pv is None or spec is None or plotter is None:
@@ -195,8 +200,8 @@ def build_container_reference(plotter, spec, name="container_ref",
         px, py = wc["pitch"]
         rows, cols = wc["rows"], wc["cols"]
         row_labels = [chr(ord("A") + i) for i in range(rows)]
-        # Her kuyu: AYRI wireframe (pickable=False) + saydam dolu silindir hitbox
-        # (pickable=True). Hitbox, ince tel kafese tiklama zorlugunu cozer.
+        # Her kuyu: AYRI wireframe (pickable=False). create_hitboxes ise ayrica
+        # saydam dolu silindir hitbox (pickable=True) eklenir; degilse SALT-GORSEL.
         for row in range(rows):
             cy = ((rows - 1) / 2.0 - row) * py      # A(+Y ust) -> son satir(-Y alt)
             for col in range(cols):
@@ -207,15 +212,17 @@ def build_container_reference(plotter, spec, name="container_ref",
                                         line_width=line_width, name=wname,
                                         pickable=False, render=False)
                 actor_names.append(wname)
-                hb = pv.Cylinder(center=(cx, cy, h / 2.0), direction=(0, 0, 1),
-                                 radius=r * 0.92, height=h)
-                hb.field_data["well_idx"] = np.array([len(wells)], dtype=int)
-                hname = f"well_hit_{wid}"
-                plotter.add_mesh(hb, color=color, opacity=hitbox_opacity,
-                                 name=hname, pickable=True, render=False)
-                actor_names.append(hname)
-                wells[wid] = {"center": (cx, cy), "wire": wire,
-                              "hitbox_name": hname}
+                well_info = {"center": (cx, cy), "wire": wire}
+                if create_hitboxes:
+                    hb = pv.Cylinder(center=(cx, cy, h / 2.0), direction=(0, 0, 1),
+                                     radius=r * 0.92, height=h)
+                    hb.field_data["well_idx"] = np.array([len(wells)], dtype=int)
+                    hname = f"well_hit_{wid}"
+                    plotter.add_mesh(hb, color=color, opacity=hitbox_opacity,
+                                     name=hname, pickable=True, render=False)
+                    actor_names.append(hname)
+                    well_info["hitbox_name"] = hname
+                wells[wid] = well_info
     else:
         return empty
 
