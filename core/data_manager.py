@@ -49,9 +49,12 @@ class DataManager:
     @staticmethod
     def format_protocol_detail(name: str, d: dict, bp_text: str) -> str:
         """Generate the human-readable detail text for a protocol snapshot."""
+        wells = d.get('bp_selected_wells', [])
+        wells_txt = ", ".join(wells) if wells else "None"
         return (
             f"Selected Protocol: {name}\n\n"
             f"Build Platform - {bp_text}\n\n"
+            f"Selected Wells - {wells_txt}\n\n"
             f"Selected Printhead - Printhead {d.get('ph_id', 1)}\n\n"
             f"Printhead Temperature - {d.get('ph_temp', 0.0):.1f} °C\n\n"
             f"Platform Temperature - {d.get('plat_temp', 0.0):.1f} °C\n\n"
@@ -115,6 +118,7 @@ class DataManager:
                 "petri_diameter_mm": d.get("bp_dia") if d.get("bp_type") == 0 else None,
                 "well_format": d.get("bp_well_format") if d.get("bp_type") == 1 else None,
                 "glass_size_mm": d.get("bp_size") if d.get("bp_type") == 2 else None,
+                "selected_wells": d.get("bp_selected_wells", []) if d.get("bp_type") == 1 else [],
             }
         }
 
@@ -162,6 +166,7 @@ class DataManager:
                     "bp_dia": str(bp.get("petri_diameter_mm") or "60") if bp_type == 0 else "60",
                     "bp_well_format": (bp.get("well_format") or 6) if bp_type == 1 else 6,
                     "bp_size": str(bp.get("glass_size_mm") or "20x60") if bp_type == 2 else "20x60",
+                    "bp_selected_wells": bp.get("selected_wells", []) if bp_type == 1 else [],
                     "model_name": p.get("model_name", "Not Selected"),
                     "stl_path": p.get("stl_path", ""),
                 }

@@ -13,15 +13,31 @@ from PyQt6.QtWidgets import (
     QWidget, QVBoxLayout, QHBoxLayout, QGridLayout, QStackedWidget,
     QPushButton, QButtonGroup, QLabel, QFrame, QLineEdit,
 )
-from PyQt6.QtCore import Qt
+from PyQt6.QtCore import Qt, pyqtSignal
 from PyQt6.QtGui import QIntValidator
 
 from ui.styles import BTN_STYLE_CHECKABLE
 
 
 class PlatformTab(QWidget):
+    # Platform tipi / well formati / kuyu secimi degisince yayilan TEK sinyal.
+    # Payload ornegi: {"type":"well_plate","well_format":6,"selected_wells":["A1",...]}
+    platform_changed = pyqtSignal(dict)
+
+    # Kuyu butonu stili: secili = dolu acik mavi, bos = beyaz + mavi kenarlik.
+    # :checked pseudo-state programatik setChecked'te de otomatik uygulanir.
+    _WELL_BTN_STYLE = """
+        QPushButton { background:#FFFFFF; color:#1565C0; border:2px solid #1E88E5;
+                      border-radius:6px; font-size:14px; font-weight:bold; }
+        QPushButton:hover   { background:#E3F2FD; }
+        QPushButton:checked { background:#4FC3F7; color:#FFFFFF; border:2px solid #0277BD; }
+    """
+
     def __init__(self, parent: QWidget | None = None) -> None:
         super().__init__(parent)
+        # Merkezi kuyu-secim state'i (G-code'a kadar tasinan tek dogru kaynak).
+        self.selected_wells: set[str] = set()
+        self.well_buttons: dict[str, QPushButton] = {}
         layout = QVBoxLayout(self)
         self._build(layout)
         self._connect_internal()
@@ -135,6 +151,15 @@ class PlatformTab(QWidget):
         well_btn_row.addSpacing(15)
         well_btn_row.addWidget(self.btn_12)
         lw.addLayout(well_btn_row)
+
+        # Secili kuyular bilgi etiketi ("None" ya da "A1, A2, ...").
+        lw.addSpacing(15)
+        self.selected_wells_lbl = QLabel("Selected wells: None")
+        self.selected_wells_lbl.setWordWrap(True)
+        self.selected_wells_lbl.setStyleSheet(
+            "font-size:15px; color:#1565C0; font-weight:bold;")
+        lw.addWidget(self.selected_wells_lbl, alignment=Qt.AlignmentFlag.AlignCenter)
+
         self.bp_stacked.addWidget(p_well)
 
         # Glass Slide
@@ -212,58 +237,178 @@ class PlatformTab(QWidget):
     def _connect_internal(self) -> None:
         # Petri/Well/Glass toggles its own stacked sub-page.
         self.bp_buton_grubu.idClicked.connect(self.bp_stacked.setCurrentIndex)
-        # 6 / 12 rebuilds its own grid.
-        self.btn_6.clicked.connect(self._update_well_grid)
-        self.btn_12.clicked.connect(self._update_well_grid)
+        # Platform tipi degisimi: Well disina cikilirsa secim temizlenir + sinyal.
+        self.bp_buton_grubu.idClicked.connect(self._on_type_clicked)
+        # 6 / 12: toggled -> grid'i yeniden kur (programatik setChecked'te de calisir,
+        # ornegin protokol yuklemede). clicked -> yalnizca kullanici; sinyali yayar.
+        self.btn_6.toggled.connect(lambda c: self._on_format_toggled(6, c))
+        self.btn_12.toggled.connect(lambda c: self._on_format_toggled(12, c))
+        self.btn_6.clicked.connect(self._emit_platform_changed)
+        self.btn_12.clicked.connect(self._emit_platform_changed)
+        # Petri/Glass olcu girisi TAMAMLANINCA (parca-girise degil) sinyal yayilir.
+        self.in_dia.editingFinished.connect(self._emit_platform_changed)
+        self.in_size_x.editingFinished.connect(self._emit_platform_changed)
+        self.in_size_y.editingFinished.connect(self._emit_platform_changed)
 
     # ==========================================================
     # INTERNAL VISUAL LOGIC
     # ==========================================================
     def _update_well_grid(self) -> None:
-        """6 veya 12 well seçimine göre grid'i yeniden oluşturur."""
+        """6/12 secimine gore kuyu grid'ini CHECKABLE butonlarla yeniden kurar.
+
+        Format degisince eski secimler temizlenir (self.selected_wells + butonlar).
+        Butonlar :checked pseudo-state ile otomatik renklenir (dolu mavi / bos beyaz).
+        """
         if not hasattr(self, 'well_grid_layout'):
             return
 
-        # Eski widget'ları temizle
+        # Eski widget'lari temizle
         while self.well_grid_layout.count():
             item = self.well_grid_layout.takeAt(0)
             if item.widget():
                 item.widget().deleteLater()
 
-        is_12 = self.btn_12 and self.btn_12.isChecked()
+        # Format degisti -> eski secimler gecersiz; state'i sifirla.
+        self.selected_wells.clear()
+        self.well_buttons = {}
 
+        is_12 = bool(self.btn_12 and self.btn_12.isChecked())
         header_style = "font-size:16px; color:#333333; font-weight:bold; border:none;"
 
         if is_12:
-            # 12-well: 3 satır (A,B,C) x 4 sütun (1,2,3,4)
-            rows = ['A', 'B', 'C']
-            cols = 4
-            circle_size = 35
+            # 12-well: 3 satir (A,B,C) x 4 sutun (1..4)
+            rows, cols, sz = ['A', 'B', 'C'], 4, 40
         else:
-            # 6-well: 2 satır (A,B) x 3 sütun (1,2,3)
-            rows = ['A', 'B']
-            cols = 3
-            circle_size = 50
+            # 6-well: 2 satir (A,B) x 3 sutun (1..3)
+            rows, cols, sz = ['A', 'B'], 3, 55
 
-        # Sütun başlıkları (1, 2, 3, ...)
+        # Sutun basliklari (1, 2, 3, ...)
         for i in range(cols):
             n = QLabel(str(i + 1))
             n.setStyleSheet(header_style)
             self.well_grid_layout.addWidget(n, 0, i + 1, alignment=Qt.AlignmentFlag.AlignCenter)
 
-        # Satırlar ve daireler
+        # Satir basligi + her kuyu icin checkable buton (uzerinde kuyu adi yazar).
         for row_idx, row_label in enumerate(rows, start=1):
             h = QLabel(row_label)
             h.setStyleSheet(header_style)
             self.well_grid_layout.addWidget(h, row_idx, 0, alignment=Qt.AlignmentFlag.AlignCenter)
-
             for col in range(1, cols + 1):
-                c = QFrame()
-                c.setFixedSize(circle_size, circle_size)
-                c.setStyleSheet("border:2px solid #64B5F6; border-radius:{}px;".format(circle_size // 2))
-                self.well_grid_layout.addWidget(c, row_idx, col, alignment=Qt.AlignmentFlag.AlignCenter)
+                wid = f"{row_label}{col}"          # A1, A2, ... B1 ...
+                btn = QPushButton(wid)
+                btn.setCheckable(True)
+                btn.setFixedSize(sz, sz)
+                btn.setStyleSheet(self._WELL_BTN_STYLE)
+                btn.toggled.connect(
+                    lambda checked, w=wid: self._on_well_button_toggled(w, checked))
+                self.well_grid_layout.addWidget(btn, row_idx, col,
+                                                alignment=Qt.AlignmentFlag.AlignCenter)
+                self.well_buttons[wid] = btn
 
         # Container boyutunu ayarla
-        total_width = cols * (circle_size + 10) + 40
-        total_height = len(rows) * (circle_size + 10) + 40
+        total_width = cols * (sz + 10) + 40
+        total_height = len(rows) * (sz + 10) + 40
         self.well_shape_container.setFixedSize(total_width, total_height)
+        self._update_selected_wells_label()
+
+    # ==========================================================
+    # WELL SELECTION — state + signal
+    # ==========================================================
+    @staticmethod
+    def _float_or(txt, default: float) -> float:
+        try:
+            return float(str(txt).strip())
+        except (ValueError, TypeError):
+            return default
+
+    def _sorted_wells(self) -> list:
+        """A1,A2,...,B1 dogal siralamasi (once harf satiri, sonra sayi sutunu)."""
+        def _key(w: str):
+            return (w[0], int(w[1:])) if len(w) >= 2 and w[1:].isdigit() else (w, 0)
+        return sorted(self.selected_wells, key=_key)
+
+    def _update_selected_wells_label(self) -> None:
+        lbl = getattr(self, 'selected_wells_lbl', None)
+        if lbl is None:
+            return
+        wells = self._sorted_wells()
+        lbl.setText("Selected wells: " + (", ".join(wells) if wells else "None"))
+
+    def _on_well_button_toggled(self, well_id: str, checked: bool) -> None:
+        """Kullanici bir kuyu butonuna tikladi (programatik degisiklikler blocked)."""
+        if checked:
+            self.selected_wells.add(well_id)
+        else:
+            self.selected_wells.discard(well_id)
+        self._update_selected_wells_label()
+        self._emit_platform_changed()
+
+    def _on_format_toggled(self, fmt: int, checked: bool) -> None:
+        # toggled her iki butonda da atesler; grid'i YALNIZCA aktif olanda kur.
+        if checked:
+            self._update_well_grid()
+
+    def _on_type_clicked(self, kind_id: int) -> None:
+        # Well Plate disina (Petri/Glass) gecilirse kuyu secimleri temizlenir.
+        if kind_id != 1 and self.selected_wells:
+            self.selected_wells.clear()
+            for btn in self.well_buttons.values():
+                if btn.isChecked():
+                    btn.blockSignals(True)
+                    btn.setChecked(False)
+                    btn.blockSignals(False)
+            self._update_selected_wells_label()
+        self._emit_platform_changed()
+
+    def _emit_platform_changed(self) -> None:
+        self.platform_changed.emit(self.get_platform_config())
+
+    # ==========================================================
+    # PUBLIC API (controller / protokol yukleme / 3D viewport picking)
+    # ==========================================================
+    def get_platform_config(self) -> dict:
+        """Mevcut platform secimini normalize edilmis dict olarak dondurur."""
+        kind_id = self.bp_buton_grubu.checkedId() if self.bp_buton_grubu else 0
+        if kind_id == 1:            # Well Plate
+            fmt = 12 if (self.btn_12 and self.btn_12.isChecked()) else 6
+            return {"type": "well_plate", "well_format": fmt,
+                    "selected_wells": self._sorted_wells()}
+        if kind_id == 2:            # Glass Slide
+            return {"type": "glass",
+                    "size_x": self._float_or(self.in_size_x.text(), 20.0),
+                    "size_y": self._float_or(self.in_size_y.text(), 60.0),
+                    "selected_wells": []}
+        return {"type": "petri",    # Petri Dish (varsayilan)
+                "diameter": self._float_or(self.in_dia.text(), 60.0),
+                "selected_wells": []}
+
+    def set_selected_wells(self, wells, emit_signal: bool = True) -> None:
+        """Verilen kuyulari sec (gecersizleri yok sayar). Butonlar SESSIZCE guncellenir.
+
+        emit_signal=False: 3D viewport picking ve protokol yuklemesi bu yolu kullanir
+        (butonlari senkronlar ama geri-sinyal DONGUSU olusturmaz).
+        """
+        valid = set(self.well_buttons.keys())
+        new_sel = {w for w in (wells or []) if w in valid}
+        self.selected_wells = new_sel
+        for wid, btn in self.well_buttons.items():
+            want = wid in new_sel
+            if btn.isChecked() != want:
+                btn.blockSignals(True)
+                btn.setChecked(want)
+                btn.blockSignals(False)
+        self._update_selected_wells_label()
+        if emit_signal:
+            self._emit_platform_changed()
+
+    def clear_selected_wells(self, emit_signal: bool = True) -> None:
+        """Tum kuyu secimlerini temizler (butonlar sessizce cozulur)."""
+        self.selected_wells.clear()
+        for btn in self.well_buttons.values():
+            if btn.isChecked():
+                btn.blockSignals(True)
+                btn.setChecked(False)
+                btn.blockSignals(False)
+        self._update_selected_wells_label()
+        if emit_signal:
+            self._emit_platform_changed()

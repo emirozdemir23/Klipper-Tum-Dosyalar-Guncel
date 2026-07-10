@@ -11,6 +11,7 @@ unmodified. Only three call-site redirects differ from the monolith:
 from __future__ import annotations
 
 import threading
+import time
 from copy import deepcopy
 from pathlib import Path
 from typing import Optional
@@ -25,11 +26,13 @@ from PyQt6.QtWidgets import (
     QFrame, QButtonGroup, QListWidgetItem, QFileDialog, QInputDialog, QMessageBox,
     QApplication,
 )
-from PyQt6.QtCore import QTimer, QThread, Qt
+from PyQt6.QtCore import QTimer, QThread, Qt, QObject, pyqtSignal
 
-from core.viewport import pv, QtInteractor, build_platform_grid, build_axis_arrows
+from core.viewport import (pv, QtInteractor, build_platform_grid, build_axis_arrows,
+                           build_container_reference, CONTAINER_DEFAULTS)
+from ui.styles import DIALOG_STYLE
 from core.slicer_worker import SliceWorker
-from core.gcode_exporter import generate_gcode
+from core.gcode_exporter import generate_gcode, generate_gcode_multi_origin
 from core.data_manager import DataManager
 from ui.components import (
     SterilizationTab, ProtocolTab, PlatformTab, ModelTab,
@@ -46,6 +49,21 @@ def _thread_alive(thread) -> bool:
         return bool(thread is not None and thread.isRunning())
     except Exception:
         return False
+
+
+class _MoonrakerBridge(QObject):
+    """R1: Arka plan POST thread'lerinden GUI thread'ine GUVENLI hata koprusu.
+
+    Sinyaller Python daemon thread'lerinden emit edilir; alici slotlar
+    (KlipperArayuzu) GUI thread'inde yasadigi icin Qt baglantiyi otomatik
+    QUEUED yapar — slot HER ZAMAN GUI thread'inde kosar, widget'lara dokunmak
+    guvenlidir. Worker'lar widget'lara ASLA dogrudan dokunmaz.
+    """
+    failed = pyqtSignal(str)     # teslim edilemedi / reddedildi → kirmizi banner
+    recovered = pyqtSignal(str)  # yeniden denemede basari → yesil bilgi banner'i
+    polled = pyqtSignal(object)  # R3: 5 sn'lik durum yoklamasi sonucu (dict)
+    # G-code upload sonucu (arka plan thread'den GUI'ye): (success, filename_or_empty, message)
+    gcode_upload_finished = pyqtSignal(bool, str, str)
 
 
 class KlipperArayuzu(QWidget):
@@ -70,14 +88,35 @@ class KlipperArayuzu(QWidget):
         # silinmiş widget'lara dokunmasını engeller (_on_slice_*, _show_layer).
         self._closing = True
 
+        # R3: durum yoklamasini durdur (yikim sirasinda yeni tick gelmesin;
+        # ucustaki son yoklama _closing kontrolune takilip zararsiz duser).
+        if getattr(self, '_status_timer', None) is not None:
+            try:
+                self._status_timer.stop()
+            except Exception:
+                pass
+
         # Worker sinyallerini önce kopar: quit/wait sırasında kuyruğa düşmüş bir
         # finished/error, ana thread'de yıkım anında slot tetiklemesin.
         if getattr(self, '_slice_worker', None) is not None:
             try:
                 self._slice_worker.finished.disconnect()
                 self._slice_worker.error.disconnect()
+                self._slice_worker.aborted.disconnect()
             except Exception:
                 pass
+
+        # İşbirlikçi iptal isteği: worker bayrağı blok sınırında görüp ms içinde
+        # döner → aşağıdaki 5 sn'lik wait/terminate() son çaresine pratikte hiç
+        # düşülmez (terminate RPi4'te yarım VTK/GIL durumu bırakabilir).
+        workers = [getattr(self, '_slice_worker', None)]
+        workers.extend(wk for (wk, _th) in getattr(self, '_retired_threads', []))
+        for _wk in workers:
+            if _wk is not None:
+                try:
+                    _wk.request_abort()
+                except Exception:
+                    pass   # deleteLater ile C++ tarafı silinmiş olabilir
 
         # Çalışan slice thread'ini güvenle durdur: worker bitmeden VTK/ana thread
         # yıkılırsa segfault olur. Kapanışta beklemek kabul edilir AMA gerçek bir
@@ -111,6 +150,268 @@ class KlipperArayuzu(QWidget):
                 pass
         event.accept()
 
+    def keyPressEvent(self, event) -> None:
+        """Kiosk/tam ekran kisayollari: Esc -> tam ekrandan cik, F11 -> toggle.
+
+        Esc yalnizca tam ekrandayken etkilidir (PC'de test kolayligi); diger tuslar
+        normal isleyise (super) gider.
+        """
+        key = event.key()
+        if key == Qt.Key.Key_Escape and self.isFullScreen():
+            self.showNormal()
+            return
+        if key == Qt.Key.Key_F11:
+            self.showNormal() if self.isFullScreen() else self.showFullScreen()
+            return
+        super().keyPressEvent(event)
+
+    # ==========================================================
+    # R1: NON-MODAL ALERT BANNER (Moonraker teslim uyarilari)
+    # ==========================================================
+    _BANNER_CSS = {
+        "error": ("QLabel { background:#D32F2F; color:white; font-size:14px; "
+                  "font-weight:bold; padding:8px 12px; border-radius:6px; }"),
+        "info":  ("QLabel { background:#2E7D32; color:white; font-size:14px; "
+                  "font-weight:bold; padding:8px 12px; border-radius:6px; }"),
+    }
+
+    def _on_moonraker_failed(self, msg: str) -> None:
+        self._show_banner(msg, kind="error")
+
+    def _on_moonraker_recovered(self, msg: str) -> None:
+        self._show_banner(msg, kind="info")
+
+    def _show_banner(self, msg: str, kind: str = "error") -> None:
+        """Ust kenarda suzulen, MODAL OLMAYAN uyari seridi (kiosk-guvenli).
+
+        * Dokunuslara SEFFAF (WA_TransparentForMouseEvents) → altindaki hicbir
+          kontrolu asla bloklamaz; kapanma otomatiktir (error 12 sn, info 4 sn;
+          yeni mesaj sureyi bastan baslatir).
+        * YALNIZCA GUI thread'inden cagrilmalidir — bridge sinyalleri zaten
+          queued gelir; worker thread'ler bu metodu dogrudan CAGIRMAZ.
+        """
+        if self._closing:
+            return
+        if self._alert_banner is None:
+            self._alert_banner = QLabel(self)
+            self._alert_banner.setWordWrap(True)
+            self._alert_banner.setAttribute(
+                Qt.WidgetAttribute.WA_TransparentForMouseEvents, True)
+            self._banner_timer = QTimer(self)
+            self._banner_timer.setSingleShot(True)
+            self._banner_timer.timeout.connect(self._hide_banner)
+        self._alert_banner.setStyleSheet(
+            self._BANNER_CSS.get(kind, self._BANNER_CSS["error"]))
+        self._alert_banner.setText(msg)
+        self._position_banner()
+        self._alert_banner.setVisible(True)
+        self._alert_banner.raise_()
+        self._banner_timer.start(12000 if kind == "error" else 4000)
+
+    def _hide_banner(self) -> None:
+        if self._alert_banner is not None:
+            self._alert_banner.setVisible(False)
+
+    def _position_banner(self) -> None:
+        if self._alert_banner is None:
+            return
+        margin = 12
+        self._alert_banner.setFixedWidth(max(100, self.width() - 2 * margin))
+        self._alert_banner.adjustSize()
+        self._alert_banner.move(margin, 8)
+
+    def resizeEvent(self, event) -> None:
+        super().resizeEvent(event)
+        if self._alert_banner is not None and self._alert_banner.isVisible():
+            self._position_banner()
+
+    # ==========================================================
+    # R3: PRINTER STATUS POLL  +  R4: MOTION PRE-FLIGHT
+    # ==========================================================
+    def _poll_printer_status(self) -> None:
+        """R3: Moonraker durum yoklamasi — GUI'yi ASLA bloklamaz.
+
+        TEK GET ile uc nesne: webhooks (Klipper ready mi), print_stats
+        (state + print_duration) ve toolhead.homed_axes. Blocking istek daemon
+        thread'de kosar; sonuc bridge.polled (queued) ile GUI'ye doner. Ust uste
+        binme _poll_inflight ile onlenir (timeout 1.5 s < 5 s kadans; bayrak
+        sonuc slotunda dusurulur).
+        """
+        if requests is None or self._closing or self._poll_inflight:
+            return
+        self._poll_inflight = True
+        bridge = self._moonraker_bridge
+        url = (f"{self._MOONRAKER_URL}/printer/objects/query"
+               "?webhooks&print_stats=state,print_duration&toolhead=homed_axes")
+
+        def _worker() -> None:
+            st = {"online": False, "ready": False, "homed": "",
+                  "print_state": "", "print_duration": None, "detail": ""}
+            try:
+                resp = requests.get(url, timeout=1.5)
+                if resp.status_code == 200:
+                    data = resp.json().get("result", {}).get("status", {})
+                    wh = data.get("webhooks") or {}
+                    ps = data.get("print_stats") or {}
+                    th = data.get("toolhead") or {}
+                    st.update(
+                        online=True,
+                        ready=(str(wh.get("state", "")) == "ready"),
+                        homed=str(th.get("homed_axes", "") or ""),
+                        print_state=str(ps.get("state", "") or ""),
+                        print_duration=ps.get("print_duration"),
+                        detail=str(wh.get("state_message", "") or "")[:200],
+                    )
+                else:
+                    # Moonraker ayakta ama Klipper bagli/hazir degil (tipik 503).
+                    st.update(online=True, ready=False,
+                              detail=f"HTTP {resp.status_code}")
+            except Exception as exc:          # RequestException + JSON hatalari
+                st["detail"] = str(exc)[:200]
+            try:
+                bridge.polled.emit(st)        # kapanis yarisina karsi sarili
+            except Exception:
+                pass
+
+        threading.Thread(target=_worker, daemon=True, name="moonraker-poll").start()
+
+    def _on_printer_status(self, st: dict) -> None:
+        """R3 (GUI thread'i): yoklama sonucu → durum alanlari + gosterge + butonlar."""
+        self._poll_inflight = False
+        if self._closing or not isinstance(st, dict):
+            return
+        self._moonraker_online = bool(st.get("online"))
+        self._klippy_ready = bool(st.get("ready"))
+        self._homed_axes = st.get("homed") or ""
+        if self._klippy_ready:
+            self._print_state = st.get("print_state") or ""
+        conn = ("ready" if self._klippy_ready
+                else ("not-ready" if self._moonraker_online else "offline"))
+        if conn != self._last_conn_state:   # konsola yalnizca DEGISIMDE yaz
+            print(f"[R3-POLL] durum={conn} homed='{self._homed_axes}' "
+                  f"print='{self._print_state}' detay='{st.get('detail', '')}'")
+            self._last_conn_state = conn
+        self._update_conn_label()
+        # Buton/sayac gercegi YALNIZCA saglikli veriyle surulur; offline ya da
+        # Klipper hazir degilken DOKUNMA (dev makinesi + Moonraker restart'i
+        # lokal durumu bozmasin). Kullanici eyleminden sonraki 2.5 sn'lik
+        # iyimser pencerede de dokunma: eylemden ONCE yola cikmis bir yoklama
+        # sonucu butonlari geri cevirip titretmesin.
+        if self._klippy_ready and \
+                (time.monotonic() - self._last_print_action_ts) >= 2.5:
+            self._apply_print_state(st)
+
+    def _apply_print_state(self, st: dict) -> None:
+        """print_stats.state → Print/Pause/Stop butonlari + sayac resync.
+
+        R2 yerel sayaci yalnizca gosterge yapmisti; R3 ile gercek durum burada
+        baglanir: elapsed her yoklamada print_duration'a esitlenir (drift yok),
+        dis kaynakli (ornegin dogrudan Moonraker'dan baslatilan) baski da GUI'ye
+        yansir. Baski yokken elapsed SIFIRLANMAZ (son deger okunur kalir; yeni
+        baslangic _start_print'te sifirlar).
+        """
+        state = st.get("print_state") or ""
+        dur = st.get("print_duration")
+        if state in ("printing", "paused") and isinstance(dur, (int, float)) and dur >= 0:
+            self._print_elapsed = int(dur)
+        if state == "printing":
+            self._print_paused = False
+            if self.print_timer is None:
+                self.print_timer = QTimer(self)
+                self.print_timer.timeout.connect(self._print_tick)
+            if not self.print_timer.isActive():
+                self.print_timer.start(1000)
+            self._set_print_btn_states(printing=True, paused=False)
+        elif state == "paused":
+            self._print_paused = True
+            if self.print_timer and self.print_timer.isActive():
+                self.print_timer.stop()
+            self._set_print_btn_states(printing=False, paused=True)
+        else:
+            # standby / complete / cancelled / error → baski yok.
+            self._print_paused = False
+            if self.print_timer and self.print_timer.isActive():
+                self.print_timer.stop()
+            self._set_print_btn_states(printing=False, paused=False)
+        self._update_print_display()
+
+    def _update_conn_label(self) -> None:
+        lbl = getattr(self, "conn_status_lbl", None)
+        if lbl is None:
+            return
+        if requests is None:
+            text, color = "●  'requests' kurulu değil", "#9E9E9E"
+        elif self._moonraker_online is None:
+            text, color = "●  Bağlantı: bekleniyor…", "#9E9E9E"
+        elif not self._moonraker_online:
+            text, color = "●  Bağlantı yok", "#D32F2F"
+        elif not self._klippy_ready:
+            text, color = "●  Klipper hazır değil", "#EF6C00"
+        elif self._print_state == "printing":
+            text, color = "●  Yazdırıyor", "#2E7D32"
+        elif self._print_state == "paused":
+            text, color = "●  Duraklatıldı", "#EF6C00"
+        elif "xyz" not in self._homed_axes:
+            text, color = "●  Hazır — G28 gerekli", "#EF6C00"
+        else:
+            text, color = "●  Hazır", "#2E7D32"
+        lbl.setText(text)
+        lbl.setStyleSheet(
+            f"font-size:12px; font-weight:bold; color:{color};"
+            " padding:4px 2px; background:transparent;")
+
+    def _motion_allowed(self) -> bool:
+        """R4: hareket baslatan komutlarin on-kosulu.
+
+        Makine durumu POZITIF biliniyorsa (Moonraker ulasilabilir + Klipper
+        ready) homed sarti aranir. Baglanti yok / hazir degil / henuz
+        yoklanmadi durumlarinda True doner (fail-open): dev makinesinde UI
+        kullanilabilir kalir ve baglanti sorunlari zaten status etiketi + R1
+        banner'lariyla gorunur. SERT kapi her kosulda firmware'dedir
+        (PRINT_START kilidi + jog makrolarindaki homed kapilari).
+        """
+        if not (self._moonraker_online and self._klippy_ready):
+            return True
+        return "xyz" in self._homed_axes
+
+    def _motion_preflight(self, label: str) -> bool:
+        """R4: engellendiyse nedenini banner'da acikla ve False don."""
+        if self._motion_allowed():
+            return True
+        self._show_banner(
+            f"{label} engellendi: eksenler home değil. Önce G28, sonra "
+            "CALIBRATE_Z_OFFSET çalıştır.", kind="error")
+        return False
+
+    def _send_jog_macro(self, macro: str) -> None:
+        """R4: jog butonlari icin ON-KONTROLLU gonderim (gelecek jog UI bunu kullanacak).
+
+        Klipper'daki jog kapisi REDDI HTTP 200 ile doner (makro icindeki
+        RESPOND TYPE=error Moonraker icin 'basari'dir) → teslim kontrolu (R1)
+        reddi YAKALAYAMAZ. Bu yuzden homed durumu R3 yoklamasindan ONCEDEN
+        bilinir ve komut daha hic gonderilmeden engellenip aciklanir.
+        """
+        if not self._motion_preflight(f"JOG ({macro})"):
+            return
+        self._send_moonraker_request("/printer/gcode/script", {"script": macro})
+
+    def _exit_application(self) -> None:
+        """Kiosk modunda OS'e donmek icin uygulamayi GUVENLE kapat.
+
+        Ham QApplication.quit() yerine ONCE self.close() cagrilir: closeEvent zaten
+        slice thread'lerini durdurur + VTK plotter'lari kapatir (RPi4'te segfault
+        onleme). Ardindan quit() event loop'u kesin sonlandirir -> OS'e doner.
+        """
+        reply = QMessageBox.question(
+            self, "Exit Application",
+            "Uygulamadan cikip isletim sistemine donulsun mu?",
+            QMessageBox.StandardButton.Yes | QMessageBox.StandardButton.No,
+            QMessageBox.StandardButton.No,
+        )
+        if reply == QMessageBox.StandardButton.Yes:
+            self.close()            # closeEvent: thread + VTK plotter teardown
+            QApplication.quit()     # garanti cikis -> OS
+
     def _init_state(self) -> None:
         """Non-widget state: data layer, timers, slice results, plotter handles."""
         # --- Data layer (JSON persistence) ---
@@ -132,10 +433,25 @@ class KlipperArayuzu(QWidget):
         self._print_elapsed: int = 0
         self._print_total: int = 3600   # default 60 dakika
         self._print_paused: bool = False
+        # Baski baslatma (Export → Moonraker upload → /printer/print/start) durumu.
+        self._last_gcode_path: Optional[str] = None       # son basarili export dosya yolu
+        self._last_gcode_filename: Optional[str] = None    # yalnizca dosya adi
+        self._print_start_inflight: bool = False           # upload ucustayken cift-tik engeli
 
         # 3D Model
         self.stl_dosya_yolu: Optional[str] = None
         self.plotter = None
+        self._model_actor = None              # (legacy) tek model aktoru — artik kullanilmiyor
+        self._well_registry: dict = {}        # well_id -> {"center":(x,y), "wire":actor, "hitbox_name":str}
+        self._container_actor_names: list = []  # mevcut kap aktor isimleri (temizlik)
+        self._selected_well = None            # (legacy) tek kuyu — coklu icin _selected_wells kullanilir
+        self._picking_enabled: bool = False   # enable_mesh_picking yalnizca 1 kez kurulur
+        # --- COKLU KUYU (well-plate) merkezi state ---
+        self._selected_wells: set = set()        # secili kuyu id kumesi (UI + 3D senkron)
+        self._loaded_model_mesh = None           # normalize STL mesh (memory'de; kuyulara kopyalanir)
+        self._well_model_actor_names: list = []  # sahnedeki model kopya aktorlerinin adlari
+        self.platform_config: dict = {}          # PlatformTab'den gelen son config
+        self._container_signature = None         # kap yeniden cizimi yalnizca type/format/olcu degisince
 
         # Slice sonuçları
         self._slices: list = []           # Her katmanın pyvista slice objesi
@@ -151,9 +467,47 @@ class KlipperArayuzu(QWidget):
         # Lifecycle guards: prevent re-entrant slicing and late-slot crashes.
         self._slicing: bool = False      # True while a slice thread is in flight
         self._closing: bool = False      # True once closeEvent has begun teardown
+        # Dilimleme surerken YENI model yuklenirse: ucustaki sonuc artik yanlis
+        # modele ait -> bayatlanir; _on_slice_done sonucu SAKLAMADAN atar (yanlis
+        # modelin katmanlarini onizleyip/exportlayip BASMAYI onler).
+        self._slice_stale: bool = False
         # Retired (finishing) threads kept alive until they self-finish, so we
         # never GC a running thread and never block the GUI with wait().
         self._retired_threads: list = []
+
+        # R1: Moonraker teslim koprusu + modal olmayan uyari banner'i.
+        # Bridge self'e parent'li → GUI thread'inde yasar; sinyaller daemon
+        # thread'lerden emit edilse de slotlar queued olarak GUI'de kosar.
+        # Banner widget'i LAZY kurulur (_show_banner ilk cagrida olusturur).
+        self._moonraker_bridge = _MoonrakerBridge(self)
+        self._moonraker_bridge.failed.connect(self._on_moonraker_failed)
+        self._moonraker_bridge.recovered.connect(self._on_moonraker_recovered)
+        # Arka plan G-code upload sonucu GUI thread'inde islenir (queued sinyal).
+        self._moonraker_bridge.gcode_upload_finished.connect(self._on_gcode_upload_finished)
+        self._alert_banner = None                      # lazy QLabel overlay
+        self._banner_timer: Optional[QTimer] = None
+
+        # R3: 5 sn'lik Moonraker durum yoklamasi (webhooks + print_stats +
+        # toolhead.homed_axes, TEK GET). Sonuc daemon thread'den bridge.polled
+        # (queued) ile GUI'ye gelir. Buton/sayac gercegi YALNIZCA Klipper
+        # 'ready' verisiyle surulur: offline/haberslik yoklama lokal durumu
+        # BOZMAZ (dev makinesinde UI aynen calisir). R4 on-kontrolu de
+        # (_motion_allowed) bu alanlari okur.
+        self._moonraker_bridge.polled.connect(self._on_printer_status)
+        self._moonraker_online: Optional[bool] = None  # None = henuz yoklanmadi
+        self._klippy_ready: bool = False
+        self._homed_axes: str = ""
+        self._print_state: str = ""                    # print_stats.state
+        self._poll_inflight: bool = False
+        self._last_print_action_ts: float = 0.0        # iyimser tutma penceresi
+        self._last_conn_state: str = ""                # konsola yalnizca degisimde yaz
+        self._status_timer: Optional[QTimer] = None
+        if requests is not None:
+            self._status_timer = QTimer(self)
+            self._status_timer.timeout.connect(self._poll_printer_status)
+            self._status_timer.start(5000)
+            # Ilk yoklamayi bekletme: event loop basladiktan hemen sonra sor.
+            QTimer.singleShot(400, self._poll_printer_status)
 
         # Layer-slider debounce (RPi4): valueChanged her pikselde _show_layer'ı
         # tetiklerse CPU çöker. Tek-atış 150 ms timer ile son konuma bir kez render.
@@ -168,6 +522,8 @@ class KlipperArayuzu(QWidget):
         # _render_last_idx: tamamlanan katmanlar yalnızca katman değişince yeniden
         # çizilsin diye (gereksiz yeniden çizimi önler).
         self._render_last_idx: int = -1
+        # Preview'de well-plate kopya aktorlerinin adlari (kare-basi temizlik icin).
+        self._preview_well_actor_names: list = []
 
     # ==========================================================
     # WINDOW & LAYOUT
@@ -176,6 +532,15 @@ class KlipperArayuzu(QWidget):
         self.setWindowTitle("Klipper Control Interface")
         self.resize(800, 480)
         self.setStyleSheet("QWidget { background-color: #F8F9FA; color: #212121; }")
+
+        # Diyalog pencerelerini (QMessageBox / QInputDialog / QDialog) dokunmatik-
+        # okunur yap. APP-GENELINDE verilir ki ad-hoc olusturulan diyaloglara da
+        # ulassin. Seciciler yalnizca QDialog ve alt siniflarini hedefler; bu pencere
+        # bir QWidget (QDialog DEGIL) oldugundan ana arayuz ETKILENMEZ. Mevcut app
+        # stiline EKLENIR (clobber etmez).
+        _app = QApplication.instance()
+        if _app is not None:
+            _app.setStyleSheet((_app.styleSheet() or "") + DIALOG_STYLE)
 
     def _create_main_layout(self) -> None:
         self.ana_duzen = QHBoxLayout()
@@ -215,6 +580,20 @@ class KlipperArayuzu(QWidget):
             if name == "Preview":
                 self.preview_btn = btn
         self.sol_menu_duzeni.addStretch()
+
+        # R3: baglanti/durum gostergesi — 5 sn'lik yoklamayla renklenir
+        # (gri=bekliyor, kirmizi=baglanti yok, turuncu=Klipper hazir degil /
+        # G28 gerekli, yesil=hazir/yazdiriyor). Kiosk'ta operatorun Print'in
+        # neden gri oldugunu GORDUGU yer burasi.
+        self.conn_status_lbl = QLabel(
+            "●  'requests' kurulu değil" if requests is None
+            else "●  Bağlantı: bekleniyor…")
+        self.conn_status_lbl.setWordWrap(True)
+        self.conn_status_lbl.setFixedWidth(140)
+        self.conn_status_lbl.setStyleSheet(
+            "font-size:12px; font-weight:bold; color:#9E9E9E;"
+            " padding:4px 2px; background:transparent;")
+        self.sol_menu_duzeni.addWidget(self.conn_status_lbl)
 
     def _create_pages(self) -> None:
         """Instantiate the tab components in side-menu order and stack them."""
@@ -297,6 +676,7 @@ class KlipperArayuzu(QWidget):
         self.save_btn = self.settings_tab.save_btn
         self.slice_btn = self.settings_tab.slice_btn
         self.slice_progress = self.settings_tab.slice_progress
+        self.exit_app_btn = self.settings_tab.exit_app_btn
 
         # Preview (vertical layer slider only)
         self.layer_plotter_frame = self.preview_tab.layer_plotter_frame
@@ -347,6 +727,11 @@ class KlipperArayuzu(QWidget):
         if self.btn_12:
             self.btn_12.clicked.connect(self._update_platform_info)
 
+        # 3D referans kap + COKLU model kopyalari: PlatformTab tek "platform_changed"
+        # sinyaliyle (type/format/olcu/kuyu secimi) tum viewport guncellemesini surer.
+        # (Eski dagitik _draw_container baglantilari bu tek yola tasindi.)
+        self.platform_tab.platform_changed.connect(self._on_platform_config_changed)
+
         if self.uv_start_btn:
             self.uv_start_btn.clicked.connect(self._start_uv)
         if self.uv_stop_btn:
@@ -358,6 +743,9 @@ class KlipperArayuzu(QWidget):
 
         if self.confirm_platform_btn:
             self.confirm_platform_btn.clicked.connect(self._confirm_platform)
+
+        if getattr(self, "exit_app_btn", None):
+            self.exit_app_btn.clicked.connect(self._exit_application)
 
         if self.open_stl_btn:
             self.open_stl_btn.clicked.connect(self._select_stl)
@@ -512,6 +900,12 @@ class KlipperArayuzu(QWidget):
             self.kutu_plat_temp.setValue(d.get("plat_temp", -30.0))
             self.kutu_plat_temp.blockSignals(False)
 
+        # Well Plate secili kuyularini arayuze + merkezi state'e yansit (emit YOK →
+        # dongu olmaz). _show_stl (varsa) kabi + model kopyalarini bu secime gore cizer.
+        wells = d.get("bp_selected_wells", [])
+        self.platform_tab.set_selected_wells(wells, emit_signal=False)
+        self._selected_wells = set(wells)
+
         self._update_platform_info()
 
         stl_path = d.get("stl_path", "")
@@ -594,6 +988,14 @@ class KlipperArayuzu(QWidget):
             self.kutu_plat_temp.setValue(d.get("plat_temp", -30.0))
             self.kutu_plat_temp.blockSignals(False)
 
+        # Well Plate secili kuyularini arayuze + merkezi state'e yansit (emit YOK).
+        wells = d.get("bp_selected_wells", [])
+        self.platform_tab.set_selected_wells(wells, emit_signal=False)
+        self._selected_wells = set(wells)
+        # Model daha once yuklendiyse kabi + kopyalari tazele (plotter yoksa no-op).
+        self._draw_container()
+        self._update_model_copies()
+
         self._update_platform_info()
 
         self._editing_protocol_name = name
@@ -658,6 +1060,7 @@ class KlipperArayuzu(QWidget):
             "bp_dia": bp_dia,
             "bp_well_format": bp_wf,
             "bp_size": bp_size,
+            "bp_selected_wells": sorted(self._selected_wells),
             "layer": self.kutu_layer.value() if self.kutu_layer else 0.0,
             "speed": self.kutu_speed.value() if self.kutu_speed else 0.0,
             "grid": self.kutu_grid.currentText() if self.kutu_grid else "Linear",
@@ -775,51 +1178,117 @@ class KlipperArayuzu(QWidget):
     # Moonraker HTTP API base (Klipper host runs on the SAME Raspberry Pi).
     _MOONRAKER_URL = "http://127.0.0.1:7125"
 
-    def _send_moonraker_request(self, endpoint: str, payload: dict = None) -> None:
-        """POST to Moonraker WITHOUT ever blocking the GUI thread (fire-and-forget).
+    def _send_moonraker_request(self, endpoint: str, payload: dict = None,
+                                critical: Optional[str] = None) -> None:
+        """POST to Moonraker WITHOUT ever blocking the GUI thread.
 
         A synchronous requests.post() on the GUI thread stalls the Qt event loop
         for up to `timeout` seconds whenever Moonraker is offline or restarting
         (config save / firmware restart) — the exact freeze this project keeps
         designing out. So the blocking call runs on a short-lived DAEMON thread
-        and the GUI returns instantly; the 1.5 s timeout merely bounds that
-        worker's lifetime so a hung host can't pile up threads.
+        and the GUI returns instantly; the 1.5 s timeout merely bounds each
+        attempt so a hung host can't pile up threads.
 
-        Thread safety: the worker touches NO Qt objects — only `requests` and
-        `print` — so there is no cross-thread widget access. Callers don't read a
-        response; failures are logged, never raised (a missing/restarting
-        Moonraker must not pop a modal or crash the app).
+        critical=None (varsayilan): eski at-ve-unut davranisi — hata yalnizca
+        loglanir. Kozmetik komutlar icin (M117, sicaklik hedefi, START_*...).
+
+        critical="STOP_UV" gibi bir etiketle TESLIM DOGRULANIR (R1):
+          * Ag hatasi / timeout (Moonraker kapali ya da yeniden basliyor):
+            1-2-3 sn artan arayla TOPLAM 4 deneme. Her basarisiz denemede ve
+            nihai basarisizlikta GUI'ye banner cikar (queued sinyal uzerinden).
+          * HTTP != 200 (sunucu ayakta ama komut REDDEDILDI): yeniden deneme
+            ANLAMSIZ — sunucunun hata mesaji bir kez banner'da gosterilir.
+
+        Thread safety: worker Qt widget'larina ASLA dokunmaz; yalnizca
+        _MoonrakerBridge sinyali emit eder (alici slot GUI thread'inde kosar).
+        Kapanis yarisina karsi emit try/except ile sarilidir.
         """
         if requests is None:
             print(f"[Moonraker] 'requests' yok → {endpoint} atlandı.")
+            if critical:
+                # GUI thread'indeyiz (cagiranlar slot) → dogrudan banner guvenli.
+                self._on_moonraker_failed(
+                    f"{critical} gonderilemedi: 'requests' kutuphanesi kurulu degil!")
             return
 
         url = f"{self._MOONRAKER_URL}{endpoint}"
+        bridge = self._moonraker_bridge
+        attempts = 4 if critical else 1
+
+        def _emit(sig_name: str, msg: str) -> None:
+            # Kapanis sirasinda koprunun C++ tarafi silinmis olabilir → yut.
+            try:
+                getattr(bridge, sig_name).emit(msg)
+            except Exception:
+                pass
 
         def _worker() -> None:
-            try:
-                requests.post(url, json=payload, timeout=1.5)
-            except requests.exceptions.RequestException as exc:
-                # Offline / restarting / timeout — beklenen, sessizce yut + logla.
-                print(f"[Moonraker] POST {endpoint} başarısız (offline/restart?): {exc}")
-            except Exception as exc:
-                # Beklenmeyen — yine de GUI'ye sızdırma, yalnızca logla.
-                print(f"[Moonraker] POST {endpoint} beklenmeyen hata: {exc}")
+            for attempt in range(1, attempts + 1):
+                try:
+                    resp = requests.post(url, json=payload, timeout=1.5)
+                except requests.exceptions.RequestException as exc:
+                    # Offline / restarting / timeout.
+                    print(f"[Moonraker] POST {endpoint} başarısız "
+                          f"(deneme {attempt}/{attempts}): {exc}")
+                    if not critical:
+                        return
+                    if attempt < attempts:
+                        _emit("failed",
+                              f"{critical} iletilemedi (deneme {attempt}/{attempts}) "
+                              "— yeniden deneniyor...")
+                        time.sleep(attempt)          # 1, 2, 3 sn artan bekleme
+                        continue
+                    _emit("failed",
+                          f"{critical} {attempts} DENEMEDE ILETILEMEDI! Cihaz komutu "
+                          "almamis olabilir — Moonraker/Klipper baglantisini kontrol "
+                          "et ve cihaz durumunu FIZIKSEL olarak dogrula.")
+                    return
+                except Exception as exc:
+                    # Beklenmeyen — GUI'ye sizdirma, logla (+kritikse banner).
+                    print(f"[Moonraker] POST {endpoint} beklenmeyen hata: {exc}")
+                    if critical:
+                        _emit("failed", f"{critical} gonderilemedi: {exc}")
+                    return
+
+                if resp.status_code == 200:
+                    if critical and attempt > 1:
+                        _emit("recovered",
+                              f"{critical} iletildi (deneme {attempt}/{attempts}).")
+                    return
+                # HTTP hata yaniti: sunucu ulasilabilir ama komut reddedildi →
+                # yeniden deneme anlamsiz; mesaji cikar ve bitir.
+                try:
+                    detail = str(resp.json().get("error", {}).get("message", ""))
+                except Exception:
+                    detail = (resp.text or "")[:120]
+                print(f"[Moonraker] POST {endpoint} HTTP {resp.status_code}: {detail}")
+                if critical:
+                    _emit("failed",
+                          f"{critical} reddedildi (HTTP {resp.status_code}): {detail}")
+                return
 
         threading.Thread(target=_worker, daemon=True, name="moonraker-post").start()
 
+    # (şimdilik PA8 ve PC5 pinleri bu işlem için atanmıştır. daha sonra değiştirilebilir)
     def _send_uv_command(self, state: bool) -> None:
         # START_UV / STOP_UV Klipper makrosu — Moonraker gcode/script üzerinden.
+        # R1: STOP_UV guvenlik-kritik → teslim dogrulanir (lamba fiziksel olarak
+        # ACIK kalmasin). START_UV kozmetik kalir: iletilmezse lamba hic yanmaz,
+        # tehlike olusmaz (sayac calisir ama sterilizasyon olmaz — operator gorur).
         self._send_moonraker_request(
             "/printer/gcode/script",
             {"script": "START_UV" if state else "STOP_UV"},
+            critical=None if state else "STOP_UV",
         )
 
+    # (şimdilik PA8 ve PC5 pinleri bu işlem için atanmıştır. daha sonra değiştirilebilir)
     def _send_hepa_command(self, state: bool) -> None:
         # START_HEPA / STOP_HEPA Klipper makrosu.
+        # R1: STOP_HEPA teslimi dogrulanir (fan acik kalmasin); START kozmetik.
         self._send_moonraker_request(
             "/printer/gcode/script",
             {"script": "START_HEPA" if state else "STOP_HEPA"},
+            critical=None if state else "STOP_HEPA",
         )
 
     def _on_ph_temp_changed(self, value: float) -> None:
@@ -980,9 +1449,222 @@ class KlipperArayuzu(QWidget):
             self.stl_dosya_yolu = path
             self._show_stl(path)
 
+    def _current_container_spec(self):
+        """PlatformTab secimini normalize spec dict'e cevirir; gecersiz/bos -> None."""
+        grp = getattr(self, "bp_buton_grubu", None)
+        if grp is None:
+            return None
+        kind_id = grp.checkedId()        # 0=Petri, 1=Well, 2=Glass
+        try:
+            if kind_id == 0:             # Petri Dish
+                txt = self.in_dia.text().strip() if self.in_dia else ""
+                d = float(txt) if txt else 0.0
+                if d <= 0:
+                    return None
+                return {"kind": "petri", "diameter": d,
+                        "height": CONTAINER_DEFAULTS["petri"]["height"]}
+            if kind_id == 2:             # Glass Slide
+                tx = self.in_size_x.text().strip() if self.in_size_x else ""
+                ty = self.in_size_y.text().strip() if self.in_size_y else ""
+                x = float(tx) if tx else 0.0
+                y = float(ty) if ty else 0.0
+                if x <= 0 or y <= 0:
+                    return None
+                return {"kind": "glass", "x": x, "y": y,
+                        "height": CONTAINER_DEFAULTS["glass"]["height"]}
+            if kind_id == 1:             # Well Plate (A1 @ origin)
+                fmt = 12 if (self.btn_12 and self.btn_12.isChecked()) else 6
+                return {"kind": "well", "format": fmt}
+        except (ValueError, TypeError):
+            return None
+        return None
+
+    def _draw_container(self) -> None:
+        """Secili referans kabini Model viewport'una wireframe olarak yeniden ciz.
+
+        Well plate'de footprint ayri aktor, her kuyu ayri wireframe + saydam hitbox
+        (pickable) olarak cizilir; _well_registry kuyu->aktor eslemesini tutar.
+        Model henuz yuklenmemisse (plotter yok) sessizce gecer.
+        """
+        if pv is None or getattr(self, "plotter", None) is None:
+            return
+        # Onceki kap aktorlerini (footprint + tum kuyular + hitbox'lar) temizle.
+        for nm in getattr(self, "_container_actor_names", []):
+            try:
+                self.plotter.remove_actor(nm, render=False)
+            except Exception:
+                pass
+        self._container_actor_names = []
+        self._well_registry = {}
+        spec = self._current_container_spec()
+        try:
+            if spec is not None:
+                result = build_container_reference(self.plotter, spec)
+                self._container_actor_names = result.get("actor_names", [])
+                self._well_registry = result.get("wells", {})
+            # Format degisince gecersiz kalan kuyu secimlerini ayikla (guvenlik agi;
+            # normal akista PlatformTab zaten temizler).
+            if self._well_registry:
+                self._selected_wells &= set(self._well_registry.keys())
+            # Yeni kurulan kuyulara secim renklerini uygula.
+            self._apply_well_selection_colors(render=False)
+            self.plotter.render()
+        except Exception as e:
+            print(f"[container] cizim hatasi: {e}")
+
+    def _on_well_picked(self, actor) -> None:
+        """Mesh-picking callback (use_actor=True): tiklanan kuyuyu TOGGLE eder.
+
+        - Secili degilse secilir, seciliyse secimden cikar (coklu secim).
+        - Secim PlatformTab butonlariyla senkronlanir (emit YOK -> dongu olmaz).
+        - Secili kuyularin wireframe'i ACIK MAVI (#33B5E5), digerleri turuncu (#F4511E);
+          model kopyalari secili kuyulara gore yeniden yerlesir.
+        model/footprint/wire pickable=False oldugundan callback'e yalnizca well hitbox gelir.
+        """
+        try:
+            name = getattr(actor, "name", "") or ""
+        except Exception:
+            return
+        if not name.startswith("well_hit_"):
+            return
+        well_id = name[len("well_hit_"):]
+        if well_id not in getattr(self, "_well_registry", {}):
+            return
+        if well_id in self._selected_wells:
+            self._selected_wells.discard(well_id)
+        else:
+            self._selected_wells.add(well_id)
+        # PlatformTab butonlariyla senkronize et (emit_signal=False -> geri-dongu yok).
+        self.platform_tab.set_selected_wells(sorted(self._selected_wells), emit_signal=False)
+        self._apply_well_selection_colors(render=False)
+        self._update_model_copies()
+        print(f"[well-pick] toggled {well_id} -> secili: {sorted(self._selected_wells)}")
+
+    # ==========================================================
+    # PLATFORM CONFIG (PlatformTab.platform_changed alicisi)
+    # ==========================================================
+    def _on_platform_config_changed(self, config: dict) -> None:
+        """PlatformTab secim/format/tip degisimini 3D sahneye uygular."""
+        self.platform_config = config or {}
+        self._selected_wells = set(self.platform_config.get("selected_wells", []))
+        # Kabi YALNIZCA type/format/olcu degisince yeniden ciz (RPi4: her kuyu
+        # tiklamasi tum kuyu aktorlerini yeniden kurmasin).
+        sig = self._container_signature_of(self.platform_config)
+        if sig != self._container_signature:
+            self._container_signature = sig
+            self._draw_container()          # rebuild + secim renkleri
+        else:
+            self._apply_well_selection_colors(render=True)
+        self._update_model_copies()
+        self._update_platform_info()
+
+    @staticmethod
+    def _container_signature_of(cfg: dict):
+        """Kap yeniden cizimini tetikleyen imza (kuyu SECIMI bunu degistirmez)."""
+        t = cfg.get("type")
+        if t == "well_plate":
+            return ("well", cfg.get("well_format"))
+        if t == "glass":
+            return ("glass", cfg.get("size_x"), cfg.get("size_y"))
+        if t == "petri":
+            return ("petri", cfg.get("diameter"))
+        return (t,)
+
+    def _apply_well_selection_colors(self, render: bool = True) -> None:
+        """Secili kuyu wireframe'lerini acik mavi, digerlerini turuncu yapar."""
+        for wid, info in getattr(self, "_well_registry", {}).items():
+            try:
+                info["wire"].prop.color = "#33B5E5" if wid in self._selected_wells else "#F4511E"
+            except Exception:
+                pass
+        if render:
+            try:
+                if self.plotter is not None:
+                    self.plotter.render()
+            except Exception:
+                pass
+
+    def _update_model_copies(self) -> None:
+        """Yuklenmis modeli aktif platforma gore kopyalar (petri/glass=merkez,
+        well-plate=secili her kuyu). Eski kopyalar her cagride temizlenir."""
+        if pv is None or getattr(self, "plotter", None) is None:
+            return
+        # Onceki model kopyalarini temizle.
+        for nm in self._well_model_actor_names:
+            try:
+                self.plotter.remove_actor(nm, render=False)
+            except Exception:
+                pass
+        self._well_model_actor_names = []
+
+        mesh = self._loaded_model_mesh
+        if mesh is None:
+            try:
+                self.plotter.render()
+            except Exception:
+                pass
+            return
+
+        def _add_copy(name: str, cx: float, cy: float) -> None:
+            # Merkez (0,0) icin deep-copy gereksiz (RPi4 bellek); kuyu ofseti varsa kopyala.
+            if cx or cy:
+                mc = mesh.copy(deep=True)
+                mc.translate((cx, cy, 0.0), inplace=True)
+            else:
+                mc = mesh
+            self.plotter.add_mesh(mc, color="#29b6f6", show_edges=False,
+                                  lighting=True, name=name, pickable=False, render=False)
+            self._well_model_actor_names.append(name)
+
+        kind_id = self.bp_buton_grubu.checkedId() if self.bp_buton_grubu else 0
+        if kind_id != 1:
+            # Petri / Glass -> tek kopya, yatak merkezinde.
+            _add_copy("model_copy_center", 0.0, 0.0)
+        elif not self._selected_wells:
+            print("[model-copies] No well selected")
+        else:
+            for wid in sorted(self._selected_wells):
+                info = self._well_registry.get(wid)
+                if not info:
+                    continue
+                cx, cy = info["center"]
+                _add_copy(f"model_copy_{wid}", cx, cy)
+        try:
+            self.plotter.render()
+        except Exception:
+            pass
+
+    def _local_preview_origins(self) -> list:
+        """Preview icin (well_id, cx, cy) yerel koordinatlar.
+
+        Petri/Glass ya da kuyu secilmemis -> [("", 0.0, 0.0)] (tek merkez).
+        Well-plate + secili kuyular -> her kuyu icin yerel merkez.
+        """
+        kind_id = self.bp_buton_grubu.checkedId() if self.bp_buton_grubu else 0
+        if kind_id != 1:
+            return [("", 0.0, 0.0)]
+        origins = []
+        for wid in sorted(self._selected_wells):
+            info = self._well_registry.get(wid)
+            if info:
+                cx, cy = info["center"]
+                origins.append((wid, float(cx), float(cy)))
+        return origins
+
     def _show_stl(self, path: str) -> None:
         if pv is None or QtInteractor is None or self.uc_boyutlu_alan is None:
             return
+
+        # Uçuşta bir dilimleme varsa: sonucu artık YANLIŞ modele ait olacak.
+        # Bayatla (geç gelen finished saklanmadan atılır) + işbirlikçi iptal iste
+        # (worker blok sınırlarında bayrağı görüp 'aborted' ile erken döner).
+        if self._slicing:
+            self._slice_stale = True
+            try:
+                if self._slice_worker is not None:
+                    self._slice_worker.request_abort()
+            except Exception:
+                pass
 
         try:
             if self.plotter is None:
@@ -1001,6 +1683,20 @@ class KlipperArayuzu(QWidget):
                 self.plotter = QtInteractor(self.uc_boyutlu_alan)
                 self.uc_boyutlu_alan.layout().addWidget(self.plotter.interactor)
 
+                # 3D KUYU SECIMI: sol-tik mesh picking. use_actor=True -> callback
+                # tiklanan AKTORU alir; adindan ("well_hit_A1") kuyuyu cozeriz.
+                # Yalnizca well hitbox'lari pickable; model/footprint/wire pickable=False
+                # oldugundan non-well tiklamalar callback'te no-op olur.
+                if not self._picking_enabled:
+                    try:
+                        self.plotter.enable_mesh_picking(
+                            callback=self._on_well_picked, use_actor=True,
+                            show=False, show_message=False, left_clicking=True,
+                        )
+                        self._picking_enabled = True
+                    except Exception as e:
+                        print(f"[picking] enable_mesh_picking kurulamadi: {e}")
+
             # Eski sahneyi ve TÜM slice/preview durumunu temizle: aksi halde
             # önceki modelin ghost'u, cache'leri ve VTK aktörleri bellekte kalır.
             self.plotter.clear()
@@ -1013,6 +1709,8 @@ class KlipperArayuzu(QWidget):
             self._infills = []
             self._all_layers_mesh = None
             self._original_mesh = None
+            self._loaded_model_mesh = None
+            self._well_model_actor_names = []
             self._current_layer_idx = 0
             self._last_plate_size = None
             # Önizleme durumunu sıfırla: yeni model dilimlenene kadar eski
@@ -1064,19 +1762,17 @@ class KlipperArayuzu(QWidget):
             )
             build_platform_grid(self.plotter, plate_size, z_grid=0.01)
 
-            # --- MODEL ---
-            self.plotter.add_mesh(
-                mesh,
-                color="#29b6f6",
-                show_edges=False,
-                edge_color="#01579b",
-                lighting=True,
-                smooth_shading=False,
-                specular=0.20,
-                specular_power=32,
-                ambient=0.6,
-                diffuse=0.7,
-            )
+            # --- MODEL --- Tek aktor yerine memory'de sakla; sahneye kopyalar
+            # _update_model_copies() ile eklenir (petri/glass=merkez, well-plate=
+            # secili kuyu sayisi kadar). Her kuyu icin dosyadan TEKRAR okunmaz.
+            self._loaded_model_mesh = mesh
+            self._model_actor = None
+
+            # --- REFERANS KAP (Petri/Well/Glass wireframe; well'de kuyular @ origin) ---
+            self._draw_container()
+
+            # --- MODEL KOPYALARI (petri/glass=merkez; well-plate=secili kuyular) ---
+            self._update_model_copies()
 
             # --- AYDINLATMA ---
             self.plotter.remove_all_lights()
@@ -1186,9 +1882,11 @@ class KlipperArayuzu(QWidget):
             self._slice_thread.started.connect(self._slice_worker.run)
             self._slice_worker.finished.connect(self._on_slice_done)
             self._slice_worker.error.connect(self._on_slice_error)
+            self._slice_worker.aborted.connect(self._on_slice_aborted)
             self._slice_worker.progress.connect(self.slice_progress.setValue)
             self._slice_worker.finished.connect(self._slice_thread.quit)
             self._slice_worker.error.connect(self._slice_thread.quit)
+            self._slice_worker.aborted.connect(self._slice_thread.quit)
             self._slice_thread.finished.connect(self._slice_worker.deleteLater)
             self._slice_thread.finished.connect(self._slice_thread.deleteLater)
 
@@ -1198,6 +1896,7 @@ class KlipperArayuzu(QWidget):
                 self.slice_progress.setVisible(True)
 
             self._slicing = True
+            self._slice_stale = False   # bu ucus guncel modele ait
             self._slice_thread.start()
         except Exception as exc:
             self._slicing = False
@@ -1216,6 +1915,13 @@ class KlipperArayuzu(QWidget):
             return
         # Tüm gövde korumalı: bir slot istisnası PyQt6'da uygulamayı abort ettirir.
         try:
+            # Bayat sonuç: dilimleme sürerken kullanıcı YENİ model yükledi. Bu
+            # sonuç ESKİ modele ait — saklanırsa önizleme/export yanlış modeli
+            # gösterir (biyoyazıcıda yanlış yapı basılır). At; finally bloğu
+            # butonu/progress'i yine de sıfırlar.
+            if self._slice_stale:
+                print("[SLICE] Bayat dilim sonucu atıldı (dilimleme sırasında model değişti).")
+                return
             # 1. Sonuçları sakla
             self._slices            = slices
             self._layer_meshes      = layer_meshes
@@ -1242,8 +1948,9 @@ class KlipperArayuzu(QWidget):
             #    Önizleme yalnızca aktif katman + infill + ghost çizer.
             self._render_last_idx = -1
 
-            # 5. Dikey katman slider'ı: Layer 1'de (value 0, invertedAppearance
-            #    ile EN ALTTA) başlar. Sinyalleri bloklayarak kur.
+            # 5. Dikey katman slider'ı: Layer 1'de (value 0) başlar — Qt dikey
+            #    varsayılanıyla EN ALTTA (invertedAppearance KAPALI; açmak
+            #    kaydıracı ters çevirir!). Sinyalleri bloklayarak kur.
             top = max(0, n_layers - 1)
             if self.layer_slider is not None:
                 self.layer_slider.blockSignals(True)
@@ -1273,16 +1980,35 @@ class KlipperArayuzu(QWidget):
             self.slice_btn.setEnabled(True)
         if self.slice_progress is not None:
             self.slice_progress.setVisible(False)
-        if self._closing:
+        # Bayat (model değişti) bir işin hatası kullanıcıyı ilgilendirmez —
+        # durum yukarıda sıfırlandı, popup gösterme.
+        if self._closing or self._slice_stale:
             return
         QMessageBox.critical(self, "Slice Hatası", msg)
+
+    def _on_slice_aborted(self) -> None:
+        """İşbirlikçi iptal onayı: worker 'aborted' dedi — durumu SESSİZCE sıfırla.
+
+        finished/error gelmeyeceği için buton/progress kilidi burada açılır;
+        popup yok (iptal kasıtlı: model değişti ya da uygulama kapanıyor).
+        """
+        self._slicing = False
+        if self._closing:
+            return
+        if self.slice_btn:
+            self.slice_btn.setEnabled(True)
+        if self.slice_progress is not None:
+            self.slice_progress.setVisible(False)
+        print("[SLICE] Dilimleme iptal edildi (model değişimi/kapanış).")
 
     # ==========================================================
     # PRINT
     # ==========================================================
     def _set_print_btn_states(self, printing: bool, paused: bool) -> None:
         if self.print_btn:
-            self.print_btn.setEnabled(not printing)
+            # R4 gri-buton: makine BILINEN sekilde home degilse baslatma/devam
+            # kapali (neden, yan menudeki status etiketinde: "G28 gerekli").
+            self.print_btn.setEnabled((not printing) and self._motion_allowed())
             self.print_btn.setText("Resume" if paused else "Print")
         if self.pause_btn:
             self.pause_btn.setEnabled(printing)
@@ -1298,38 +2024,155 @@ class KlipperArayuzu(QWidget):
             self.remaining_deger.setText(f"{r_m:02d}:{r_s:02d} min")
 
     def _print_tick(self) -> None:
+        # R2: Sure tahmini dolunca ASLA _stop_print() CAGIRMA — o yol Moonraker'a
+        # /printer/print/cancel (→ CANCEL_PRINT) gonderir ve 60. dakikada GERCEK
+        # baskiyi oldururdu. Yerel sayac saniyelik GOSTERGE dolgusudur; R3 poll'u
+        # her 5 sn'de elapsed'i GERCEK print_stats.print_duration'a esitler ve
+        # baski gercekten bitince (state != printing) sayaci durdurur.
         self._print_elapsed += 1
-        if self._print_elapsed >= self._print_total:
-            self._stop_print()
-            return
         self._update_print_display()
 
     def _start_print(self) -> None:
+        # Cift-tiklama / yeniden-giris korumasi: bir upload ucustayken yeni
+        # baslatma denemesi yok sayilir (buton da o an disable'dir).
+        if self._print_start_inflight:
+            return
+        # R4 on-kontrol: makine hazir ama home DEGILSE baski/resume hic
+        # baslatilmaz (banner nedenini soyler). PRINT_START zaten firmware'de
+        # kilitli; bu katman reddi dokunmadan ONCE aciklamak icin var.
+        if not self._motion_preflight("PRINT"):
+            return
+
+        # print_btn duraklatmada RESUME gorevi gorur (etiketi "Resume"): gercek
+        # resume gonder ve UI'yi printing moduna al (timer sifirlanmaz).
+        if self._print_paused:
+            self._send_moonraker_request("/printer/print/resume")
+            self._enter_printing_ui(reset_timer=False)
+            return
+
+        # --- TAZE BASLANGIC: son export G-code'u Moonraker'a yukle + baslat ---
+        if not self._last_gcode_path:
+            QMessageBox.warning(
+                self, "G-Code Yok",
+                "Önce Preview sekmesinden Export G-Code yapmalısınız.")
+            return
+        if not Path(self._last_gcode_path).exists():
+            QMessageBox.warning(
+                self, "Dosya Bulunamadı",
+                "Son export edilen G-code dosyası bulunamadı.\n"
+                "Lütfen Preview sekmesinden tekrar Export G-Code yapın.")
+            return
+
+        # Upload'i ARKA PLANDA yap (GUI donmasin): UI 'printing' moduna ANCAK upload
+        # basarili olunca gecer (_on_gcode_upload_finished).
+        self._begin_gcode_upload(self._last_gcode_path)
+
+    def _begin_gcode_upload(self, local_path: str) -> None:
+        """Son export G-code'u ARKA PLAN thread'inde Moonraker'a yukler.
+
+        Upload suresince Print butonu disable + _print_start_inflight=True. Sonuc
+        gcode_upload_finished sinyaliyle GUI thread'ine doner. WORKER THREAD Qt
+        widget'larina ASLA dokunmaz — yalnizca bridge sinyali emit eder.
+        """
+        self._print_start_inflight = True
+        if self.print_btn:
+            self.print_btn.setEnabled(False)
+        bridge = self._moonraker_bridge
+
+        def _worker() -> None:
+            ok, info = self._upload_gcode_to_moonraker(local_path)
+            # info = basarida Moonraker dosya adi/path, hatada hata mesaji.
+            try:
+                bridge.gcode_upload_finished.emit(bool(ok), info if ok else "", info)
+            except Exception:
+                pass   # kapanista koprunun C++ tarafi silinmis olabilir
+
+        threading.Thread(target=_worker, daemon=True, name="gcode-upload").start()
+
+    def _enter_printing_ui(self, reset_timer: bool) -> None:
+        """UI'yi 'printing' moduna al (timer + butonlar). reset_timer=True taze baslangic."""
+        if reset_timer:
+            self._print_elapsed = 0
+            self._print_total = 3600
+        self._print_paused = False
         if self.print_timer is None:
             self.print_timer = QTimer(self)
             self.print_timer.timeout.connect(self._print_tick)
-
-        # The same print_btn doubles as RESUME while paused (its label is "Resume").
-        resuming = self._print_paused
-        if resuming:
-            # Resume the paused Klipper print.
-            self._send_moonraker_request("/printer/print/resume")
-        else:
-            # Fresh start: reset the local timer.
-            self._print_elapsed = 0
-            self._print_total   = 3600
-            # TODO (Phase 2.x): replace with real G-code generation + a true print
-            # start (SDCARD_PRINT_FILE / printer.print.start). Placeholder macro for
-            # now — just flashes a message on the printer's display.
-            self._send_moonraker_request(
-                "/printer/gcode/script",
-                {"script": "M117 G-Code generator not yet implemented"},
-            )
-
-        self._print_paused = False
         self._update_print_display()
         self._set_print_btn_states(printing=True, paused=False)
         self.print_timer.start(1000)
+        # R3: iyimser pencere ac (eylemden once yola cikan yoklama butonlari
+        # geri cevirmesin) + 3 sn sonra hizli teyit yoklamasi iste.
+        self._last_print_action_ts = time.monotonic()
+        QTimer.singleShot(3000, self._poll_printer_status)
+
+    def _upload_gcode_to_moonraker(self, local_path: str) -> tuple[bool, str]:
+        """BLOCKING: .gcode dosyasini Moonraker 'gcodes' koklerine yukler.
+
+        ARKA PLAN thread'inden cagrilir (GUI'yi bloklamamak icin); Qt widget'larina
+        ASLA dokunmaz. Donus: (True, moonraker_dosya_adi) ya da (False, hata_mesaji).
+        """
+        if requests is None:
+            return False, "'requests' kutuphanesi kurulu degil."
+        p = Path(local_path)
+        if not p.exists():
+            return False, f"Dosya bulunamadi: {local_path}"
+        url = f"{self._MOONRAKER_URL}/server/files/upload"
+        try:
+            # timeout=30: G-code/STL buyuk olabilir; 1.5 sn upload icin yetersiz.
+            with open(local_path, "rb") as fh:
+                files = {"file": (p.name, fh, "application/octet-stream")}
+                data = {"root": "gcodes"}
+                resp = requests.post(url, files=files, data=data, timeout=30)
+        except requests.exceptions.RequestException as exc:
+            return False, f"Yukleme baglanti hatasi: {exc}"
+        except Exception as exc:
+            return False, f"Yukleme hatasi: {exc}"
+        if resp.status_code in (200, 201):
+            try:
+                body = resp.json()
+            except Exception:
+                body = {}
+            print(f"[Moonraker] upload yaniti: {body}")   # response'u logla (teshis)
+            # Yanit sekli surumden surume degisebilir: 'item' ya top-level ya 'result' altinda.
+            item = body.get("item") or body.get("result", {}).get("item", {}) or {}
+            fname = item.get("path") or item.get("filename") or p.name
+            # item.path zaten koke ('gcodes') GORELI gelir; nadiren "gcodes/" one eki
+            # gelirse ayikla — /printer/print/start root-relative ad bekler.
+            if fname.startswith("gcodes/"):
+                fname = fname[len("gcodes/"):]
+            return True, fname
+        try:
+            detail = str(resp.json().get("error", {}).get("message", ""))
+        except Exception:
+            detail = (resp.text or "")[:120]
+        return False, f"Yukleme reddedildi (HTTP {resp.status_code}): {detail}"
+
+    def _start_uploaded_gcode(self, filename: str) -> None:
+        """Yuklenen dosyayi /printer/print/start ile baslat (kritik → banner'li teslim)."""
+        self._send_moonraker_request(
+            "/printer/print/start",
+            {"filename": filename},
+            critical="START_PRINT",
+        )
+
+    def _on_gcode_upload_finished(self, success: bool, filename: str, message: str) -> None:
+        """GUI thread slot'u: upload sonucu. Basarida baslat + printing UI; hatada geri al."""
+        self._print_start_inflight = False
+        if self._closing:
+            return
+        if not success:
+            # UI 'printing' moduna GECMEDI; Print butonunu geri ac + hatayi goster.
+            self._set_print_btn_states(printing=False, paused=False)
+            self._show_banner(f"Baski baslatilamadi (yukleme): {message}", kind="error")
+            return
+        # Upload OK → gercek baskiyi baslat.
+        self._start_uploaded_gcode(filename)
+        # OPTIMISTIC UI: butonlari/timer'i hemen 'printing' yap ki upload sonrasi Print
+        # butonu disable takili kalmasin. _enter_printing_ui ayni anda _last_print_action_ts'i
+        # kurup 3 sn sonra poll planlar; R3 poll GERCEK print_stats.state ile resync eder
+        # (start reddedilirse state != printing gorulur, butonlar otomatik geri alinir).
+        self._enter_printing_ui(reset_timer=True)
 
     def _pause_print(self) -> None:
         if self.print_timer and self.print_timer.isActive():
@@ -1337,7 +2180,11 @@ class KlipperArayuzu(QWidget):
         self._print_paused = True
         self._set_print_btn_states(printing=False, paused=True)
         # Update the UI instantly (above), then dispatch the pause to Klipper.
-        self._send_moonraker_request("/printer/print/pause")
+        # R1: duraklatma teslimi dogrulanir — basarisizsa baski fiilen SURUYOR
+        # demektir; banner operatoru uyarir (UI "paused" gosterse bile).
+        self._send_moonraker_request("/printer/print/pause", critical="PAUSE")
+        self._last_print_action_ts = time.monotonic()      # R3 iyimser pencere
+        QTimer.singleShot(3000, self._poll_printer_status)  # hizli teyit
 
     def _stop_print(self) -> None:
         if self.print_timer and self.print_timer.isActive():
@@ -1347,7 +2194,11 @@ class KlipperArayuzu(QWidget):
         self._update_print_display()
         self._set_print_btn_states(printing=False, paused=False)
         # Cancel the running Klipper print (Moonraker maps cancel → CANCEL_PRINT).
-        self._send_moonraker_request("/printer/print/cancel")
+        # R1: iptal teslimi dogrulanir — basarisizsa makine hala basiyor/isitiyor
+        # olabilir; banner operatoru fiziksel dogrulamaya yonlendirir.
+        self._send_moonraker_request("/printer/print/cancel", critical="CANCEL_PRINT")
+        self._last_print_action_ts = time.monotonic()      # R3 iyimser pencere
+        QTimer.singleShot(3000, self._poll_printer_status)  # hizli teyit
 
     # ==========================================================
     # PROTOCOL LOAD (disk -> memory -> list)
@@ -1409,6 +2260,23 @@ class KlipperArayuzu(QWidget):
                 plotter.add_mesh(line_mesh, color=color, name=name, render=False)
             except Exception:
                 pass
+
+    def _flatten_polydata_for_preview(self, pd, z_preview: float = 0.03):
+        """Return a deep COPY of ``pd`` with every point pinned to ``z_preview``.
+
+        Preview-only: each active layer is sliced at its real Z (``idx*layer_h``),
+        so when the vertical slider sits on a middle layer the bright active
+        geometry renders high above the build plate and *looks* like it is
+        floating. We flatten a COPY down onto the plate purely for display. The
+        original slice PolyData — and therefore the G-code / exporter path — is
+        NEVER mutated; this is a visual transform only.
+        """
+        copied = pd.copy(deep=True)
+        pts = copied.points.copy()
+        if pts.size:
+            pts[:, 2] = z_preview
+            copied.points = pts
+        return copied
 
     # Completed-layer "Line Type" colors (the active layer uses bright literals).
     _C_WALL_DONE = '#C92A2A'   # printed walls (darker red — depth cue)
@@ -1487,9 +2355,13 @@ class KlipperArayuzu(QWidget):
 
             # 1. Ghost of the full model (very faint, for context).
             if self._original_mesh is not None:
+                # Ghost = tam modelin silueti (Z=0..toplam_yukseklik). Aktif katman
+                # artik plate'e (z~0.04) indirildigi icin ghost'un alt kismi onunla
+                # ust uste geliyor; opacity'yi 0.06 -> 0.03'e dusurup aktif katmanin
+                # ustunu kapatmasini onluyoruz. Ghost KALDIRILMADI, sadece soluklasti.
                 plotter.add_mesh(
                     self._original_mesh,
-                    color='#B0BEC5', opacity=0.06,
+                    color='#B0BEC5', opacity=0.03,
                     show_edges=False, lighting=True, smooth_shading=True,
                     name='ghost', render=False,
                 )
@@ -1515,28 +2387,47 @@ class KlipperArayuzu(QWidget):
                     pass
             self._render_last_idx = idx
 
-        # ── 3. ACTIVE LAYER (full, instant) ─────────────────────────────────
-        # Clear the previous active actors first so an empty layer doesn't leave
-        # the prior layer's lines on screen (add_mesh(name=...) replaces in place).
+        # ── 3. ACTIVE LAYER (full, instant) — well-plate'de secili her kuyuya kopya ─
+        # Onceki aktif aktorleri (tek + per-well) temizle: bos katman onceki
+        # katmanin cizgilerini ekranda birakmasin.
         for _n in ('active_perimeter', 'infill_v'):
             _a = plotter.actors.get(_n)
             if _a is not None:
                 plotter.remove_actor(_a, render=False)
+        for _n in getattr(self, '_preview_well_actor_names', []):
+            _a = plotter.actors.get(_n)
+            if _a is not None:
+                plotter.remove_actor(_a, render=False)
+        self._preview_well_actor_names = []
 
-        # Symmetric bounds guards: _layer_meshes / _slices / _infills are always
-        # built to the SAME length (n_layers) in the worker, so idx (clamped to
-        # len(_slices)-1) is in range — but guard every indexed access anyway so a
-        # future partial/desynced state degrades to an empty frame, never IndexError.
+        # Symmetric bounds guards: worker _layer_meshes / _slices / _infills'i AYNI
+        # uzunlukta uretir; yine de her erisimi koruyoruz (bos kare, asla IndexError).
         active = self._layer_meshes[idx] if idx < len(self._layer_meshes) else None
         slc    = self._slices[idx] if idx < len(self._slices) else None
+        infill = self._infills[idx] if idx < len(self._infills) else None
 
         if active is not None and getattr(active, 'n_points', 0) > 0:
-            if slc is not None and slc.n_points > 0:
-                self._add_filament(plotter, slc, 0.2, '#FF0000', 'active_perimeter')
-
-            infill = self._infills[idx] if hasattr(self, '_infills') and idx < len(self._infills) else None
-            if infill is not None and getattr(infill, 'n_points', 0) > 0:
-                self._add_filament(plotter, infill, 0.15, '#FF8C00', 'infill_v')
+            # Petri/Glass -> [("", 0, 0)] (tek merkez); Well-plate -> secili kuyular.
+            # Ayni dilim verisi kuyulara TRANSLATE edilerek cogaltilir (yeniden slice yok).
+            for well_id, cx, cy in self._local_preview_origins():
+                p_name = f'active_perimeter_{well_id}' if well_id else 'active_perimeter'
+                i_name = f'infill_{well_id}' if well_id else 'infill_v'
+                # Preview-only: aktif katmani gercek Z'sinden (idx*layer_h) build
+                # plate ustune indiriyoruz ki havada durmasin. Helper HER ZAMAN
+                # deep-copy dondurur → G-code/slice verisi degismez. Perimeter ve
+                # infill'e minik Z farki (0.04 / 0.05) veriyoruz ki cakismasinlar.
+                if slc is not None and slc.n_points > 0:
+                    slc_c = self._flatten_polydata_for_preview(slc, z_preview=0.04)
+                    if cx or cy:
+                        slc_c.translate((cx, cy, 0.0), inplace=True)  # sadece XY
+                    self._add_filament(plotter, slc_c, 0.2, '#FF0000', p_name)
+                    self._preview_well_actor_names.append(p_name)
+                if infill is not None and getattr(infill, 'n_points', 0) > 0:
+                    inf_c = self._flatten_polydata_for_preview(infill, z_preview=0.05)
+                    if cx or cy:
+                        inf_c.translate((cx, cy, 0.0), inplace=True)  # sadece XY
+                    self._add_filament(plotter, inf_c, 0.15, '#FF8C00', i_name)
+                    self._preview_well_actor_names.append(i_name)
 
         # ── SINGLE RENDER CALL ──────────────────────────────────────────────
         if self.layer_plotter.interactor.isVisible():
@@ -1576,16 +2467,55 @@ class KlipperArayuzu(QWidget):
             return
 
         layer_h = self.kutu_layer.value() if self.kutu_layer else 0.2
+        bed_cx, bed_cy = 120.0, 60.0   # Klipper makro yatak merkezi (X120 Y60)
 
-        # RPi4: generate_gcode streams to disk and is numpy-vectorised, so it is
-        # fast for realistic bioprint models. Rather than a full worker thread,
-        # this deliberate one-off action shows a wait cursor + disables the button
-        # so the GUI stays honest while it runs.
+        # Aktif baski kafasi -> tool makrosu (Printhead 1/2/3 -> T0/T1/T2).
+        ph_id = self.ph_buton_grubu.checkedId() if self.ph_buton_grubu else 1
+        active_tool = {1: "T0", 2: "T1", 3: "T2"}.get(ph_id, "T0")
+        # Baski hizi (mm/s) -> feedrate (mm/dk).
+        speed_mms = self.kutu_speed.value() if self.kutu_speed else 10
+        print_speed = max(1.0, float(speed_mms)) * 60.0
+
+        # Well Plate ise: secili her kuyuya AYNI modelin kopyasi (tek dosya, coklu
+        # origin). Diger platformlarda (petri/glass) eski tek-origin yol korunur.
+        is_well = (self.bp_buton_grubu.checkedId() if self.bp_buton_grubu else 0) == 1
+        origins = None
+        if is_well:
+            if not self._selected_wells:
+                QMessageBox.warning(
+                    self, "Kuyu Secilmedi",
+                    "Well Plate secildi fakat kuyu secilmedi.\n"
+                    "Lütfen A1, A2 gibi en az bir kuyu seçin.")
+                return
+            origins = []
+            for wid in sorted(self._selected_wells):
+                info = getattr(self, "_well_registry", {}).get(wid)
+                if info and "center" in info:
+                    cx, cy = info["center"]
+                    origins.append((wid, bed_cx + cx, bed_cy + cy))
+            if not origins:
+                QMessageBox.warning(
+                    self, "Kuyu Merkezleri Yok",
+                    "Secili kuyularin merkezleri bulunamadi. Önce Model sekmesinden "
+                    "STL yükleyip Well Plate kabini çizdirin.")
+                return
+
+        # RPi4: G-code motoru diske stream eder + numpy-vektorize. Ayri worker yerine
+        # bekleme imleci + buton kilidi ile GUI durust kalir.
         self.export_gcode_btn.setEnabled(False)
         QApplication.setOverrideCursor(Qt.CursorShape.WaitCursor)
         try:
-            moves = generate_gcode(self._slices, self._infills, path,
-                                   layer_height=layer_h)
+            if is_well:
+                moves = generate_gcode_multi_origin(
+                    self._slices, self._infills, path,
+                    origins=origins, layer_height=layer_h,
+                    active_tool=active_tool, print_speed=print_speed)
+            else:
+                moves = generate_gcode(self._slices, self._infills, path,
+                                       layer_height=layer_h,
+                                       origin_x=bed_cx, origin_y=bed_cy,
+                                       active_tool=active_tool,
+                                       print_speed=print_speed)
         except Exception as exc:
             QMessageBox.critical(self, "Export Hatası",
                                  f"G-Code üretilemedi:\n{exc}")
@@ -1594,10 +2524,25 @@ class KlipperArayuzu(QWidget):
             QApplication.restoreOverrideCursor()
             self.export_gcode_btn.setEnabled(True)
 
-        QMessageBox.information(
-            self, "G-Code Hazır",
-            f"G-Code kaydedildi:\n{path}\n\n"
-            f"{moves} ekstrüzyon hamlesi · {len(self._slices)} katman.")
+        # Export basarili → Print butonu bu dosyayi yukleyip baslatabilsin.
+        self._last_gcode_path = path
+        self._last_gcode_filename = Path(path).name
+
+        if is_well:
+            wells_txt = ", ".join(w for w, _, _ in origins)
+            QMessageBox.information(
+                self, "G-Code Hazır",
+                f"G-Code kaydedildi:\n{path}\n\n"
+                f"{moves} ekstrüzyon hamlesi · {len(self._slices)} katman.\n"
+                f"Selected wells: {wells_txt}\nCopies: {len(origins)} · "
+                f"{active_tool} · {speed_mms:.0f} mm/s")
+        else:
+            QMessageBox.information(
+                self, "G-Code Hazır",
+                f"G-Code kaydedildi:\n{path}\n\n"
+                f"{moves} ekstrüzyon hamlesi · {len(self._slices)} katman.\n"
+                f"Kuyu: yok (yatak merkezi) · Origin ({bed_cx:.1f}, {bed_cy:.1f}) · "
+                f"{active_tool} · {speed_mms:.0f} mm/s")
 
     def _init_settings_plotter(self) -> None:
         if pv is None or QtInteractor is None or self.layer_plotter_frame is None:
