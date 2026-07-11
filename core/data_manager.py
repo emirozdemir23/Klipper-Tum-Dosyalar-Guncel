@@ -107,7 +107,7 @@ class DataManager:
             "printhead_number": d.get("ph_id", 1),
             "layer_thickness_mm": d.get("layer", 0.0),
             "print_speed_mm_s": d.get("speed", 0.0),
-            "grid_type": d.get("grid", "Linear"),
+            "grid_type": "Linear",   # desteklenen tek deger; her zaman Linear yaz
             "grid_distance_mm": d.get("distance", 0.0),
             "printhead_temperature_c": d.get("ph_temp", 0.0),
             "platform_temperature_c": d.get("plat_temp", 0.0),
@@ -158,7 +158,7 @@ class DataManager:
                     "ph_id": p.get("printhead_number", 1),
                     "layer": p.get("layer_thickness_mm", 0.2),
                     "speed": p.get("print_speed_mm_s", 10.0),
-                    "grid": p.get("grid_type", "Linear"),
+                    "grid": "Linear",   # eski JSON degeri ne olursa olsun Linear'a normalize et
                     "distance": p.get("grid_distance_mm", 0.2),
                     "ph_temp": p.get("printhead_temperature_c", 27.0),
                     "plat_temp": p.get("platform_temperature_c", -30.0),

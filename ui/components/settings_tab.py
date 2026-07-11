@@ -92,7 +92,10 @@ class SettingsTab(QWidget):
         lbl_grid.setStyleSheet(LABEL_STYLE)
         lbl_grid.setFixedWidth(190)
         self.kutu_grid = QComboBox()
-        self.kutu_grid.addItems(["Linear", "Gyroid", "Honeycomb", "Rectilinear"])
+        # Tek gercek infill deseni var (slicer_worker.build_infill_grid_2d = capraz
+        # tarama izgarasi). Baska desen fonksiyonu YOK; yaniltici secenek isimleri
+        # kaldirildi, desteklenen TEK deger "Linear".
+        self.kutu_grid.addItems(["Linear"])
         self.kutu_grid.setCurrentText("Linear")
         self.kutu_grid.setFixedWidth(120)
         self.kutu_grid.setStyleSheet(COMBOBOX_STYLE)

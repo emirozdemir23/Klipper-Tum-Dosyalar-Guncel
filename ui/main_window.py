@@ -885,7 +885,9 @@ class KlipperArayuzu(QWidget):
         if self.kutu_speed:
             self.kutu_speed.setValue(d.get("speed", 10.0))
         if self.kutu_grid:
-            self.kutu_grid.setCurrentText(d.get("grid", "Linear"))
+            # Desteklenen TEK grid tipi Linear: kayitli deger ne olursa olsun
+            # (eski / bilinmeyen / bos dahil) ACIKCA Linear'a normalize et.
+            self.kutu_grid.setCurrentText("Linear")
         if self.kutu_distance:
             self.kutu_distance.setValue(d.get("distance", 0.2))
         # blockSignals: programatik setValue (protokol yukle/sec) valueChanged'i
@@ -973,7 +975,9 @@ class KlipperArayuzu(QWidget):
         if self.kutu_speed:
             self.kutu_speed.setValue(d.get("speed", 10.0))
         if self.kutu_grid:
-            self.kutu_grid.setCurrentText(d.get("grid", "Linear"))
+            # Desteklenen TEK grid tipi Linear: kayitli deger ne olursa olsun
+            # (eski / bilinmeyen / bos dahil) ACIKCA Linear'a normalize et.
+            self.kutu_grid.setCurrentText("Linear")
         if self.kutu_distance:
             self.kutu_distance.setValue(d.get("distance", 0.2))
         # blockSignals: programatik setValue (protokol yukle/sec) valueChanged'i
@@ -1066,7 +1070,7 @@ class KlipperArayuzu(QWidget):
             "bp_selected_wells": sorted(self._selected_wells),
             "layer": self.kutu_layer.value() if self.kutu_layer else 0.0,
             "speed": self.kutu_speed.value() if self.kutu_speed else 0.0,
-            "grid": self.kutu_grid.currentText() if self.kutu_grid else "Linear",
+            "grid": "Linear",   # desteklenen tek deger; currentText'e bagli kalma
             "distance": self.kutu_distance.value() if self.kutu_distance else 0.0,
             "ph_temp": self.kutu_ph_temp.value() if self.kutu_ph_temp else 0.0,
             "plat_temp": self.kutu_plat_temp.value() if self.kutu_plat_temp else 0.0,
