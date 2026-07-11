@@ -2441,22 +2441,9 @@ class KlipperArayuzu(QWidget):
             except Exception:
                 pass
 
-    def _flatten_polydata_for_preview(self, pd, z_preview: float = 0.03):
-        """Return a deep COPY of ``pd`` with every point pinned to ``z_preview``.
-
-        Preview-only: each active layer is sliced at its real Z (``idx*layer_h``),
-        so when the vertical slider sits on a middle layer the bright active
-        geometry renders high above the build plate and *looks* like it is
-        floating. We flatten a COPY down onto the plate purely for display. The
-        original slice PolyData — and therefore the G-code / exporter path — is
-        NEVER mutated; this is a visual transform only.
-        """
-        copied = pd.copy(deep=True)
-        pts = copied.points.copy()
-        if pts.size:
-            pts[:, 2] = z_preview
-            copied.points = pts
-        return copied
+    # NOT: eski _flatten_polydata_for_preview (aktif katmani z=0.04/0.05'e indiren
+    # gorsel yardimci) KALDIRILDI — aktif katman artik GERCEK Z'sinde gosteriliyor
+    # (bkz. _render_layer). Baska kullanan yoktu (grep ile dogrulandi).
 
     # Completed-layer "Line Type" colors (the active layer uses bright literals).
     _C_WALL_DONE = '#C92A2A'   # printed walls (darker red — depth cue)
@@ -2579,16 +2566,19 @@ class KlipperArayuzu(QWidget):
         infill = self._infills[idx] if idx < len(self._infills) else None
 
         if active is not None and getattr(active, 'n_points', 0) > 0:
-            # Preview-only: aktif katmani gercek Z'sinden (idx*layer_h) build plate
-            # ustune indiriyoruz ki havada durmasin. Helper HER ZAMAN deep-copy
-            # dondurur → G-code/slice verisi degismez. Perimeter ve infill'e minik
-            # Z farki (0.04 / 0.05) veriyoruz ki cakismasinlar. XY TRANSLATE YOK →
-            # slice zaten (0,0) merkezli; ghost ile ayni koordinat sisteminde durur.
+            # Preview: aktif katmani GERCEK Z'sinde goster (slicer'in z_mids[idx]
+            # yuksekliginde). TABANA FLATTEN ETME → Layer 1 asagida, orta katman
+            # ortada, ust katman yukarida gorunur; slider yukari ciktikca aktif
+            # katman Z'de yukselir. XY TRANSLATE YOK (slice zaten (0,0) merkezli;
+            # ghost ile ayni koordinat sisteminde durur). Source _slices[idx] /
+            # _infills[idx] render pipeline'inda DEGISMESIN diye DEEP-COPY uzerinde
+            # calisiriz — Z KOORDINATI DEGISTIRILMEZ. Perimeter + infill AYNI z_mid'te
+            # oldugundan yapay Z ofseti YOK; kendi gercek Z'lerini korurlar.
             if slc is not None and slc.n_points > 0:
-                slc_c = self._flatten_polydata_for_preview(slc, z_preview=0.04)
+                slc_c = slc.copy(deep=True)
                 self._add_filament(plotter, slc_c, 0.2, '#FF0000', 'active_perimeter')
             if infill is not None and getattr(infill, 'n_points', 0) > 0:
-                inf_c = self._flatten_polydata_for_preview(infill, z_preview=0.05)
+                inf_c = infill.copy(deep=True)
                 self._add_filament(plotter, inf_c, 0.15, '#FF8C00', 'active_infill')
 
         # ── SINGLE RENDER CALL ──────────────────────────────────────────────
