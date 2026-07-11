@@ -436,6 +436,15 @@ class KlipperArayuzu(QWidget):
         # Baski baslatma (Export → Moonraker upload → /printer/print/start) durumu.
         self._last_gcode_path: Optional[str] = None       # son basarili export dosya yolu
         self._last_gcode_filename: Optional[str] = None    # yalnizca dosya adi
+        # Slice snapshot (Section 10): Slice basinda alinan geometri-etkileyen
+        # parametreler. _slice_snapshot YALNIZCA basarili finished sonrasi gecerli
+        # sayilir; _pending_slice_snapshot slice ucustayken tutulur.
+        self._slice_snapshot: Optional[dict] = None
+        self._pending_slice_snapshot: Optional[dict] = None
+        # Export snapshot (bu tur): basarili G-code export'unda alinan parametreler
+        # (slice_snapshot + origins + tool + speed + G-code dosya kimligi). Print
+        # oncesi "eski/yanlis G-code" freshness kontrolu bunu kullanir.
+        self._export_snapshot: Optional[dict] = None
         self._print_start_inflight: bool = False           # upload ucustayken cift-tik engeli
 
         # 3D Model
@@ -1134,11 +1143,17 @@ class KlipperArayuzu(QWidget):
         }
 
         # Disk write failure is surfaced but non-fatal: the in-memory store and
-        # UI still update, matching the original behavior.
+        # UI still update. AMA basari mesaji YALNIZCA gercekten diske yazildiysa
+        # gosterilir (Section L: ayni anda "Save Error" + "saved successfully"
+        # celiskisini onler).
+        wrote_disk = True
         try:
             self.dm.save_to_disk(name, self.kayitli_protokoller[name])
         except OSError as e:
-            QMessageBox.critical(self, "Save Error", str(e))
+            wrote_disk = False
+            QMessageBox.critical(
+                self, "Save Error",
+                f"Protokol diske yazılamadı (yalnızca bu oturumun belleğinde tutuldu):\n{e}")
 
         self._refresh_protocol_list()
 
@@ -1153,8 +1168,13 @@ class KlipperArayuzu(QWidget):
 
         self._editing_protocol_name = None
 
-        print(f"System: Protocol saved -> '{name}'")
-        QMessageBox.information(self, "Saved", f"Protocol '{name}' saved successfully.")
+        # Basari mesaji SADECE disk yazimi basariliysa. Aksi halde yukarida
+        # "Save Error" gosterildi; burada YANILTICI "saved successfully" gostermeyiz.
+        if wrote_disk:
+            print(f"System: Protocol saved -> '{name}'")
+            QMessageBox.information(self, "Saved", f"Protocol '{name}' saved successfully.")
+        else:
+            print(f"System: Protocol '{name}' KEPT IN MEMORY ONLY (disk write failed).")
 
     # ==========================================================
     # BUILD PLATFORM INFO CARD
@@ -1858,6 +1878,102 @@ class KlipperArayuzu(QWidget):
     # ==========================================================
     # SLICE
     # ==========================================================
+    def _current_slice_params(self) -> dict:
+        """Slice geometrisini ETKILEYEN mevcut parametreler (Section 10).
+
+        Well secimi / printhead / sicaklik / print speed BURADA YOK: bunlar ayni
+        geometriyi farkli origin/feed/temperature ile kullanabilir, slice'i
+        gecersiz yapmaz. STL degisimini path+size+mtime ile yakalar.
+        """
+        path = self.stl_dosya_yolu or ""
+        size, mtime = -1, -1
+        try:
+            st = Path(path).stat()
+            size, mtime = st.st_size, st.st_mtime_ns
+        except OSError:
+            pass
+        return {
+            "stl_path": path,
+            "stl_size": size,
+            "stl_mtime_ns": mtime,
+            "layer_height": float(self.kutu_layer.value()) if self.kutu_layer else 0.2,
+            "grid_distance": float(self.kutu_distance.value()) if self.kutu_distance else 1.0,
+            "grid_type": "Linear",
+        }
+
+    def _slice_is_dirty(self) -> bool:
+        """True → mevcut slice sonucu artik gecerli DEGIL (yeniden Slice gerekli).
+
+        Snapshot yoksa, slice verisi yoksa ya da geometri-etkileyen bir parametre
+        (STL/layer height/grid distance/grid type) slice'tan bu yana degistiyse
+        dirty. Kuyu secimi degisimi dirty YAPMAZ (ayni slice, farkli origin'ler).
+        """
+        snap = self._slice_snapshot
+        if not snap or not self._slices:
+            return True
+        return self._current_slice_params() != snap
+
+    def _export_origins_signature(self):
+        """Export'un uretecegi origin'lerin KARSILASTIRILABILIR imzasi.
+
+        Well Plate: ('well', ((wid, bed_x, bed_y), ...)) — kuyu SECIMI ve FORMAT
+        degisimini yakalar (registry merkezleri formatla degisir). Petri/Glass:
+        ('single', bed_x, bed_y). Sicaklik/slider/UV-HEPA bunu ETKILEMEZ.
+        """
+        kind_id = self.bp_buton_grubu.checkedId() if self.bp_buton_grubu else 0
+        bed_cx, bed_cy = 120.0, 60.0
+        if kind_id == 1:
+            sig = []
+            for wid in sorted(self._selected_wells):
+                info = getattr(self, "_well_registry", {}).get(wid)
+                if info and "center" in info:
+                    cx, cy = info["center"]
+                    sig.append((wid, round(bed_cx + cx, 3), round(bed_cy + cy, 3)))
+            return ("well", tuple(sig))
+        return ("single", round(bed_cx, 3), round(bed_cy, 3))
+
+    def _current_export_params(self) -> dict:
+        """Export'u ETKILEYEN mevcut parametreler: origins + active_tool + speed.
+
+        Printhead SICAKLIGI / platform sicakligi / Preview slider / UV-HEPA
+        BURADA YOK (bunlar export'u dirty YAPMAZ). Slice-dirty ayri kontrol edilir.
+        """
+        ph_id = self.ph_buton_grubu.checkedId() if self.ph_buton_grubu else 1
+        active_tool = {1: "T0", 2: "T1", 3: "T2"}.get(ph_id, "T0")
+        speed = float(self.kutu_speed.value()) if self.kutu_speed else 10.0
+        return {"origins": self._export_origins_signature(),
+                "active_tool": active_tool, "print_speed": speed}
+
+    def _export_is_dirty(self) -> bool:
+        """True → son export'lanan G-code artik gecerli DEGIL (yeniden Export gerekli).
+
+        Dirty: export snapshot yok · slice dirty · G-code dosyasi silinmis/disaridan
+        degistirilmis · origins (kuyu secimi/format) · active_tool (printhead) ya da
+        print_speed degismis. Sicaklik/slider/UV-HEPA dirty YAPMAZ.
+        """
+        snap = self._export_snapshot
+        if not snap:
+            return True
+        if self._slice_is_dirty():           # slice geometri parametresi degistiyse
+            return True
+        # KRITIK: son export'un dayandigi slice snapshot'i GUNCEL slice snapshot'i
+        # ile ayni mi? Ayni ayarlarla YENIDEN slice yapildiginda _slice_is_dirty
+        # False olur ama G-code ESKI slice'a aittir (ornegin 0.20 export → 0.10
+        # yeniden slice → yeniden export YOK) → export DIRTY. Farkli snapshot kesin
+        # dirty; ayni snapshot (deterministik) korunur.
+        if snap.get("slice_snapshot") != self._slice_snapshot:
+            return True
+        try:                                  # G-code dosya kimligi (silinmis/degismis)
+            st = Path(snap.get("gcode_path", "")).stat()
+            if st.st_size != snap.get("gcode_size") or st.st_mtime_ns != snap.get("gcode_mtime_ns"):
+                return True
+        except OSError:
+            return True
+        cur = self._current_export_params()   # origins / tool / speed
+        return (cur["origins"] != snap.get("origins")
+                or cur["active_tool"] != snap.get("active_tool")
+                or cur["print_speed"] != snap.get("print_speed"))
+
     def _slice_model(self) -> None:
         # Re-entrancy guard: ignore a second request while one is in flight.
         # (slice_btn is disabled during slicing, but this hardens other paths.)
@@ -1937,6 +2053,9 @@ class KlipperArayuzu(QWidget):
                 self.slice_progress.setValue(0)
                 self.slice_progress.setVisible(True)
 
+            # Section 10: bu Slice'in geometri parametrelerini SAKLA (pending).
+            # Basarili finished'da _slice_snapshot'a tasinir; dirty-state bunu kullanir.
+            self._pending_slice_snapshot = self._current_slice_params()
             self._slicing = True
             self._slice_stale = False   # bu ucus guncel modele ait
             self._slice_thread.start()
@@ -1974,6 +2093,9 @@ class KlipperArayuzu(QWidget):
             self._current_layer_idx = 0
             self._last_plate_size   = None  # static sahneyi yeni slice için sıfırla
             n_layers                = len(slices)
+            # Section 10: BASARILI finished → snapshot artik GECERLI. Bu andan
+            # itibaren geometri-etkileyen ayar degisirse slice "dirty" olur.
+            self._slice_snapshot = self._pending_slice_snapshot
 
             # 2. Sekme geçişini ÖNCE yap → OpenGL bağlamı aktifleşsin
             if self.preview_btn:
@@ -2103,6 +2225,22 @@ class KlipperArayuzu(QWidget):
                 self, "Dosya Bulunamadı",
                 "Son export edilen G-code dosyası bulunamadı.\n"
                 "Lütfen Preview sekmesinden tekrar Export G-Code yapın.")
+            return
+        # Section 10: dirty slice → son G-code artik gecerli parametreye ait DEGIL;
+        # eski/yanlis G-code'u BASMA. Yeniden Slice + Export iste.
+        if self._slice_is_dirty():
+            QMessageBox.warning(
+                self, "Yeniden Slice Gerekli",
+                "Dilimleme ayarları değişti. Yeniden Slice yapıp Export edin.")
+            return
+        # Slice guncel fakat EXPORT dirty ise (kuyu secimi / printhead / hiz degisti,
+        # ya da G-code dosyasi silindi/degisti) → eski G-code'u YANLIS kuyu/tool/hiz
+        # ile BASMA; yalnizca yeniden Export iste.
+        if self._export_is_dirty():
+            QMessageBox.warning(
+                self, "Yeniden Export Gerekli",
+                "Export ayarları değişti (kuyu seçimi / printhead / hız) ya da G-code "
+                "dosyası değişti/silindi.\nPreview sekmesinden yeniden Export edin.")
             return
 
         # Upload'i ARKA PLANDA yap (GUI donmasin): UI 'printing' moduna ANCAK upload
@@ -2408,26 +2546,12 @@ class KlipperArayuzu(QWidget):
                     show_edges=False, lighting=True, smooth_shading=True,
                     name='preview_ghost', render=False,
                 )
-            # 2. First-layer footprint cap (build-plate adhesion hint). A flat
-            #    bounding-box plane from the slice bounds — NOT delaunay_2d(),
-            #    whose triangulation on the GUI thread froze the UI on Layer 1.
-            base = self._slices[0] if self._slices else None
-            if base is not None and getattr(base, 'n_points', 0) > 0:
-                try:
-                    xmin, xmax, ymin, ymax, _zlo, _zhi = base.bounds
-                    plotter.add_mesh(
-                        pv.Plane(
-                            center=((xmin + xmax) / 2.0, (ymin + ymax) / 2.0, 0.015),
-                            direction=(0, 0, 1),
-                            i_size=max(1e-3, xmax - xmin),
-                            j_size=max(1e-3, ymax - ymin),
-                        ),
-                        color=self._C_BASE, opacity=0.35,
-                        show_edges=False, lighting=False,
-                        name='base_cap', render=False,
-                    )
-                except Exception:
-                    pass
+            # 2. NOT: Eski "base_cap" (ilk katman bounds'undan uretilen DIKDORTGEN
+            #    duz plane) KALDIRILDI. Daire/delikli modelde bu, gercek geometri
+            #    degilken sahte bir dikdortgen yuzey gosteriyordu (yaniltici). Taban/
+            #    yapisma gostergesi gerekiyorsa gercek ilk contour'dan uretilmeli;
+            #    bu ise ayri ve acikca isaretli bir gorsel katman olarak eklenir.
+            #    (base_cap aktoru, yukaridaki temizlik demetinde zaten kaldiriliyor.)
             self._render_last_idx = idx
 
         # ── 3. ACTIVE LAYER (full, instant) — TEK MERKEZ KOPYA ──────────────
@@ -2499,12 +2623,21 @@ class KlipperArayuzu(QWidget):
             QMessageBox.warning(self, "G-Code Yok",
                                 "Önce Settings sekmesinden bir model dilimleyin.")
             return
+        # Section 10 dirty-state: slice'tan sonra geometri-etkileyen ayar (STL /
+        # layer height / grid distance) degistiyse ESKI slice ile export YAPILMAZ.
+        if self._slice_is_dirty():
+            QMessageBox.warning(self, "Yeniden Slice Gerekli",
+                                "Dilimleme ayarları değişti. Yeniden Slice yapın.")
+            return
         path, _ = QFileDialog.getSaveFileName(
             self, "G-Code Dışa Aktar", "output.gcode", "G-Code (*.gcode)")
         if not path:
             return
 
-        layer_h = self.kutu_layer.value() if self.kutu_layer else 0.2
+        # Layer height'i Settings widget'indan DEGIL slice SNAPSHOT'undan al →
+        # export edilen G-code, dilimlenen geometriyle her zaman tutarli kalir.
+        layer_h = (self._slice_snapshot or {}).get(
+            "layer_height", self.kutu_layer.value() if self.kutu_layer else 0.2)
         bed_cx, bed_cy = 120.0, 60.0   # Klipper makro yatak merkezi (X120 Y60)
 
         # Aktif baski kafasi -> tool makrosu (Printhead 1/2/3 -> T0/T1/T2).
@@ -2538,6 +2671,15 @@ class KlipperArayuzu(QWidget):
                     "STL yükleyip Well Plate kabini çizdirin.")
                 return
 
+        # Item 3: URETIM BASLAMADAN ONCE eski export'u GECERSIZ kil. Generation
+        # (generate_gcode / multi_origin) ya da stat hata verirse eski snapshot/path
+        # GUVENILIR kalmaz → Print eski dosyayi otomatik basamaz. Basari yolunda
+        # asagida yeniden doldurulur. (Dialog Cancel yukarida donduğu icin bu satira
+        # ULASMAZ; iptal eski export'u KORUR.)
+        self._export_snapshot = None
+        self._last_gcode_path = None
+        self._last_gcode_filename = None
+
         # RPi4: G-code motoru diske stream eder + numpy-vektorize. Ayri worker yerine
         # bekleme imleci + buton kilidi ile GUI durust kalir.
         self.export_gcode_btn.setEnabled(False)
@@ -2565,6 +2707,26 @@ class KlipperArayuzu(QWidget):
         # Export basarili → Print butonu bu dosyayi yukleyip baslatabilsin.
         self._last_gcode_path = path
         self._last_gcode_filename = Path(path).name
+
+        # Export snapshot: bu G-code HANGI slice + origins + tool + speed ile ve
+        # HANGI dosya kimligiyle uretildi. Print oncesi freshness kontrolu bunu okur.
+        try:
+            _st = Path(path).stat()
+            _gsize, _gmtime = _st.st_size, _st.st_mtime_ns
+        except OSError:
+            _gsize, _gmtime = -1, -1
+        _cur_exp = self._current_export_params()
+        self._export_snapshot = {
+            # deepcopy: sonraki bir slice _slice_snapshot'i degistirse bile bu
+            # export'un dayandigi snapshot BAGIMSIZ kalir (referans paylasmaz).
+            "slice_snapshot": deepcopy(self._slice_snapshot),
+            "origins": _cur_exp["origins"],
+            "active_tool": _cur_exp["active_tool"],
+            "print_speed": _cur_exp["print_speed"],
+            "gcode_path": path,
+            "gcode_size": _gsize,
+            "gcode_mtime_ns": _gmtime,
+        }
 
         if is_well:
             wells_txt = ", ".join(w for w, _, _ in origins)

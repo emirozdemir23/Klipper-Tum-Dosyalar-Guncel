@@ -191,13 +191,15 @@ def _scan_axis(p1, p2, q1, q2, levels):
     return (np.concatenate(out_lvl), np.concatenate(out_a), np.concatenate(out_b))
 
 
-def build_infill_grid_2d(slc, z_mid, grid):
-    """Pure-numpy scanline infill (NO Shapely/GEOS).
+def build_infill_grid_2d(slc, z_mid, grid, orientation=0):
+    """Pure-numpy scanline infill (NO Shapely/GEOS) — LINEAR (tek yon/katman).
 
-    ``grid`` = (xs, ys) global scan-line positions. Cross-hatches the layer by
-    intersecting the global grid lines with the contour edges via even-odd
-    crossings (holes handled automatically). Returns a fresh PyVista PolyData of
-    line segments at ``z_mid``, or None when empty.
+    ``grid`` = (xs, ys) global scan-line positions.
+    ``orientation``: 0 = YALNIZCA yatay cizgiler (sabit y); 1 = YALNIZCA dikey
+    (sabit x). Cagiran ``i % 2`` gecerek ardisik katmanlarda yonu 90° dondurur
+    (gercek Linear infill; ayni katmanda cross-hatch URETILMEZ). Contour ile
+    even-odd kesisim delik/ada'lari tek yonde de otomatik klipler (hole
+    doldurulmaz). Bir fresh PyVista PolyData ya da bos ise None dondurur.
     """
     if grid is None or slc is None:
         return None
@@ -217,23 +219,25 @@ def build_infill_grid_2d(slc, z_mid, grid):
     pts_a = []  # (x, y) span endpoints, collected as arrays
     pts_b = []
 
-    # Horizontal scan lines (constant y): crossing axis = y, other = x.
-    ys = grid_ys[(grid_ys >= bminy) & (grid_ys <= bmaxy)]
-    if ys.size:
-        r = _scan_axis(y1, y2, x1, x2, ys)
-        if r is not None:
-            lvl, xa, xb = r
-            pts_a.append(np.column_stack([xa, lvl]))
-            pts_b.append(np.column_stack([xb, lvl]))
-
-    # Vertical scan lines (constant x): crossing axis = x, other = y.
-    xs = grid_xs[(grid_xs >= bminx) & (grid_xs <= bmaxx)]
-    if xs.size:
-        r = _scan_axis(x1, x2, y1, y2, xs)
-        if r is not None:
-            lvl, ya, yb = r
-            pts_a.append(np.column_stack([lvl, ya]))
-            pts_b.append(np.column_stack([lvl, yb]))
+    # LINEAR: tek yon/katman. orientation 0 -> yatay (sabit y), 1 -> dikey (sabit x).
+    if orientation == 0:
+        # Horizontal scan lines (constant y): crossing axis = y, other = x.
+        ys = grid_ys[(grid_ys >= bminy) & (grid_ys <= bmaxy)]
+        if ys.size:
+            r = _scan_axis(y1, y2, x1, x2, ys)
+            if r is not None:
+                lvl, xa, xb = r
+                pts_a.append(np.column_stack([xa, lvl]))
+                pts_b.append(np.column_stack([xb, lvl]))
+    else:
+        # Vertical scan lines (constant x): crossing axis = x, other = y.
+        xs = grid_xs[(grid_xs >= bminx) & (grid_xs <= bmaxx)]
+        if xs.size:
+            r = _scan_axis(x1, x2, y1, y2, xs)
+            if r is not None:
+                lvl, ya, yb = r
+                pts_a.append(np.column_stack([lvl, ya]))
+                pts_b.append(np.column_stack([lvl, yb]))
 
     if not pts_a:
         return None
@@ -313,6 +317,16 @@ class SliceWorker(QObject):
 
             if self._layer_h is None or self._layer_h <= 0:
                 self.error.emit("Katman kalınlığı 0'dan büyük olmalı.")
+                return
+
+            # Grid Distance dogrulamasi (Linear infill HER ZAMAN aktif): None / 0 /
+            # negatif / NaN / Inf gecersizdir → Slice BASARISIZ (finished ATMAZ).
+            try:
+                _d = float(self._distance) if self._distance is not None else None
+            except (TypeError, ValueError):
+                _d = None
+            if _d is None or not math.isfinite(_d) or _d <= 0.0:
+                self.error.emit("Grid Distance 0'dan büyük ve sonlu bir değer olmalıdır.")
                 return
 
             # --- READ + MultiBlock reduce ---
@@ -432,6 +446,16 @@ class SliceWorker(QObject):
             master_grid = None
             if self._distance and self._distance > 0:
                 master_grid = _build_master_grid(mesh.bounds, self._distance)
+                # Infill ISTENDI (distance>0) ama izgara kurulamadi (Grid Distance cok
+                # kucuk -> segment guvenlik sinirini asti, ya da model sinirlari
+                # gecersiz). Slice SESSIZCE infill'siz TAMAMLANMAZ: hata ver, finished ATMA.
+                # (Aksi halde "tamamen infills=None" bir slice basarili gorunurdu.)
+                if master_grid is None:
+                    self.error.emit(
+                        "Infill icin tarama izgarasi olusturulamadi.\n"
+                        "Grid Distance cok kucuk (guvenlik sinirini asti) ya da model "
+                        "sinirlari gecersiz. Grid Distance'i buyutun veya modeli kontrol edin.")
+                    return
             ng = 0 if master_grid is None else (master_grid[0].size + master_grid[1].size)
             print(f"[SLICE-PROF] master_grid: {time.perf_counter()-t0:.3f}s (lines={ng})", flush=True)
             self.progress.emit(50)
@@ -441,6 +465,8 @@ class SliceWorker(QObject):
             slices = []
             layer_meshes = []
             infills = []
+            infill_fail = 0
+            first_infill_err = None   # (layer_idx, "Type: msg") — ilk infill hatasi
             last_pct = 50  # emit only when the integer % changes (avoid signal flood)
             for i in range(n_layers):
                 if self._abort_requested():   # ucuz bool kontrolu, her katmanda
@@ -450,9 +476,17 @@ class SliceWorker(QObject):
                 layer_meshes.append(slc)   # gate-only, never mutated → share
                 if master_grid is not None and slc is not None:
                     try:
-                        infill = build_infill_grid_2d(slc, float(z_mids[i]), master_grid)
-                    except Exception:
+                        # LINEAR: ardisik katmanda yon 90° doner (cift=yatay, tek=dikey).
+                        infill = build_infill_grid_2d(slc, float(z_mids[i]), master_grid,
+                                                      orientation=i % 2)
+                    except Exception as _e:
+                        # SESSIZ YUTMA YOK: katman numarasiyla logla + ILK hatayi sakla.
                         infill = None
+                        infill_fail += 1
+                        if first_infill_err is None:
+                            first_infill_err = (i, f"{type(_e).__name__}: {_e}")
+                        print(f"[SLICE-PROF] Layer {i} infill generation failed: "
+                              f"{type(_e).__name__}: {_e}", flush=True)
                 else:
                     infill = None
                 infills.append(infill)
@@ -460,9 +494,31 @@ class SliceWorker(QObject):
                 if pct != last_pct:
                     self.progress.emit(pct)
                     last_pct = pct
-            print(f"[SLICE-PROF] infill loop ({n_layers} layers): {time.perf_counter()-t0:.3f}s", flush=True)
+            print(f"[SLICE-PROF] infill loop ({n_layers} layers): {time.perf_counter()-t0:.3f}s "
+                  f"(infill_fail={infill_fail})", flush=True)
 
             if self._abort_requested():   # son kontrol: iptal edilen is finished ATMAZ
+                return
+
+            # --- GECERLILIK (Section G): tamamen bos slice BASARILI sayilmaz ---
+            valid_contours = sum(1 for s in slices
+                                 if s is not None and getattr(s, 'n_points', 0) > 0)
+            if valid_contours == 0:
+                self.error.emit(
+                    "Dilimleme bos: hicbir katmanda gecerli kontur uretilemedi.\n"
+                    "Model kapali/gecerli bir yuzey mi, yoksa katman kalinligi cok mu buyuk?")
+                return
+            if not (len(slices) == len(layer_meshes) == len(infills)):
+                self.error.emit("Ic hata: dilim listelerinin uzunluklari tutarsiz.")
+                return
+            # Section 4: infill HATASI SESSIZCE GECILMEZ. Grid istendigi halde herhangi
+            # bir katmanda infill uretilemediyse Slice BASARISIZ olur (finished ATILMAZ);
+            # boylece yarim/eksik dolgu "Slice tamamlandi" gibi gorunmez.
+            if infill_fail > 0:
+                _li, _msg = first_infill_err if first_infill_err else (-1, "?")
+                self.error.emit(
+                    f"{infill_fail} katmanda infill uretilemedi (ilk hata Layer {_li}: {_msg}).\n"
+                    "Slice iptal edildi; lutfen modeli/ayarlari kontrol edip yeniden deneyin.")
                 return
             print(f"[SLICE-PROF] === TOTAL run(): {time.perf_counter()-t_start:.3f}s "
                   f"for {n_layers} layers ===", flush=True)

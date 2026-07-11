@@ -31,6 +31,11 @@ _TRAVEL_THRESHOLD = 1.5
 _BED_X_MAX = 230.0
 _BED_Y_MAX = 120.0
 
+# Makine Z tavani (mm). klipper.txt z1/z2 position_max ~82; guvenli tavan 83.
+# En ust dolu katmanin baski Z'si (multi-origin'de + kuyu-gecis lift'i) bu degeri
+# ASAMAZ; asarsa dosya YAZILMADAN ValueError verilir.
+_BED_Z_MAX = 83.0
+
 # XY feedrate tavani = klipper.txt [printer] max_velocity: 30 mm/s (1800 mm/dk).
 # Klipper fazlasini zaten sessizce kirpar; dosyaya makinenin YAPABILDIGI degeri
 # yazmak dosyayi durust tutar. SIRINGA GUVENLIGI NOTU: G1 X..Y..E.. hamlesinde F
@@ -134,12 +139,28 @@ def _xy_extents(slices: list, infills: list):
     return (xmin, xmax, ymin, ymax) if found else None
 
 
+def _highest_nonempty_layer(slices: list, infills: list) -> int:
+    """En ustteki (en buyuk index) BOS OLMAYAN katmanin indeksi; hicbiri yoksa -1.
+
+    Ustten asagi tarar (dolu model icin ilk kontrolde durur). Bir katman, perimetre
+    ya da infill segmenti varsa 'dolu' sayilir.
+    """
+    has_infills = bool(infills)
+    for i in range(len(slices) - 1, -1, -1):
+        s = _segments_xy(slices[i] if i < len(slices) else None)
+        inf = _segments_xy(infills[i] if has_infills and i < len(infills) else None)
+        if s.shape[0] or inf.shape[0]:
+            return i
+    return -1
+
+
 def generate_gcode(slices: list, infills: list, save_path: str,
                    layer_height: float = 0.2, flow_multiplier: float = 0.05,
                    active_tool: str = "T0",
                    origin_x: float = 120.0, origin_y: float = 60.0,
                    print_speed: float = 600.0,
-                   x_max: float = _BED_X_MAX, y_max: float = _BED_Y_MAX) -> int:
+                   x_max: float = _BED_X_MAX, y_max: float = _BED_Y_MAX,
+                   z_max: float = _BED_Z_MAX) -> int:
     """Write a continuous-extrusion G-code program to ``save_path``.
 
     Args:
@@ -196,6 +217,15 @@ def generate_gcode(slices: list, infills: list, save_path: str,
             f"Y [{fy_min:.1f} .. {fy_max:.1f}] (izinli 0 .. {y_max:.0f}).\n"
             "Daha kucuk bir model kullanin ya da farkli bir kuyu/konum secin.")
 
+    # ── Z TAVAN KONTROLU (tek origin: kuyu-gecis lift'i YOK) ──
+    hi = _highest_nonempty_layer(slices, infills)
+    highest_z = (hi + 1) * layer_height if hi >= 0 else 0.0
+    if highest_z > z_max:
+        raise ValueError(
+            "Model yuksekligi makine Z sinirini asiyor:\n"
+            f"gereken Z {highest_z:.2f} mm > izin {z_max:.1f} mm.\n"
+            "Daha alcak bir model kullanin ya da katman sayisini azaltin.")
+
     tmp_path = save_path + ".tmp"
     try:
         with open(tmp_path, 'w', encoding='utf-8') as f:
@@ -210,50 +240,58 @@ def generate_gcode(slices: list, infills: list, save_path: str,
                 slc = slices[i] if i < len(slices) else None
                 inf = infills[i] if has_infills and i < len(infills) else None
 
-                parts = []
+                # PERIMETRE ONCE, sonra INFILL: ikisi TEK NN havuzunda KARISMAZ
+                # (duvarlar dolgudan once basilir). Her grup KENDI icinde greedy
+                # nearest-neighbour siralanir. Bos katman atlanir.
                 p_seg = _segments_xy(slc)
-                if p_seg.shape[0]:
-                    parts.append(p_seg)
                 i_seg = _segments_xy(inf)
-                if i_seg.shape[0]:
-                    parts.append(i_seg)
-                if not parts:
+                if p_seg.shape[0] == 0 and i_seg.shape[0] == 0:
                     continue   # empty layer → no Z move, nothing to print
-                segs = parts[0] if len(parts) == 1 else np.concatenate(parts, axis=0)
-                # The slicer centres the model on the XY origin, so raw coords are
-                # SIGNED (negative on half the bed). Klipper enforces position_min: 0
-                # on X/Y → negative coords throw "Move out of range". Shift into the
-                # positive build area (default = bed centre) so every X/Y is in range.
-                if origin_x or origin_y:
-                    segs = segs + np.array([origin_x, origin_y], dtype=np.float64)
+                # The slicer centres the model on the XY origin → raw coords are
+                # SIGNED. Klipper enforces position_min: 0 on X/Y → shift each group
+                # into the positive build area (default = bed centre).
+                shift = np.array([origin_x, origin_y], dtype=np.float64)
+                groups = []
+                if p_seg.shape[0]:
+                    groups.append(p_seg + shift if (origin_x or origin_y) else p_seg)
+                if i_seg.shape[0]:
+                    groups.append(i_seg + shift if (origin_x or origin_y) else i_seg)
 
                 z = (i + 1) * layer_height
                 buf = [f"; LAYER {i} (z={z:.3f})"]
                 if first_descent_done:
-                    # Katmanlar arasi Z YALNIZCA YUKARI gider → once Z, sonra XY
-                    # (yeni yazilmis katmanin icinden gecmemek icin dogru sira).
+                    # Katmanlar arasi Z YALNIZCA YUKARI gider → once Z, sonra XY.
                     buf.append(f"G0 Z{z:.3f} F600")
 
-                for entry, exit_, gap in _order_layer_segments(segs, cur_xy):
-                    if gap > _TRAVEL_THRESHOLD or not first_descent_done:
-                        buf.append(f"G0 X{entry[0]:.3f} Y{entry[1]:.3f} F{travel_feed:.0f}")
-                    if not first_descent_done:
-                        # ILK inis: XY yaklasimini KALIBRASYON yuksekliginde
-                        # (CALIBRATE_Z_OFFSET cikisinda gcode Z5) yapip Z'yi ancak
-                        # ilk baski noktasinin UZERINDEyken indir. Z0.2'de kap/
-                        # kuyu kenarinin uzerinden surtunerek gecmeyi onler.
-                        buf.append(f"G0 Z{z:.3f} F600")
-                        first_descent_done = True
-                    seg_len = math.hypot(exit_[0] - entry[0], exit_[1] - entry[1])
-                    e_val = seg_len * flow_multiplier
-                    buf.append(f"G1 X{exit_[0]:.3f} Y{exit_[1]:.3f} E{e_val:.4f} F{print_speed:.0f}")
-                    moves += 1
-                    cur_xy = (float(exit_[0]), float(exit_[1]))
+                for grp in groups:   # [0]=perimetre, [1]=infill (varsa) — bu sirayla
+                    for entry, exit_, gap in _order_layer_segments(grp, cur_xy):
+                        if gap > _TRAVEL_THRESHOLD or not first_descent_done:
+                            # Buyuk bosluk (ya da ilk yaklasim): BASKI YOK, entry'ye travel.
+                            buf.append(f"G0 X{entry[0]:.3f} Y{entry[1]:.3f} F{travel_feed:.0f}")
+                        elif gap > 1e-6:
+                            # Sub-mm bosluk: surekli-baski dikisi. Kafa yine de segment
+                            # ENTRY'sine ULASMALI → dikisi entry'ye EKSTRUZE et (E =
+                            # gercek dikis uzunlugu). Eskiden dogrudan exit'e cizilen G1
+                            # entry'yi atliyor + capraz geometri + E-uyusmazligi yapiyordu.
+                            buf.append(f"G1 X{entry[0]:.3f} Y{entry[1]:.3f} "
+                                       f"E{gap * flow_multiplier:.4f} F{print_speed:.0f}")
+                            moves += 1
+                            cur_xy = (float(entry[0]), float(entry[1]))
+                        if not first_descent_done:
+                            # ILK inis: XY yaklasimini KALIBRASYON yuksekliginde yapip
+                            # Z'yi ancak ilk baski noktasinin UZERINDEyken indir.
+                            buf.append(f"G0 Z{z:.3f} F600")
+                            first_descent_done = True
+                        seg_len = math.hypot(exit_[0] - entry[0], exit_[1] - entry[1])
+                        e_val = seg_len * flow_multiplier
+                        buf.append(f"G1 X{exit_[0]:.3f} Y{exit_[1]:.3f} E{e_val:.4f} F{print_speed:.0f}")
+                        moves += 1
+                        cur_xy = (float(exit_[0]), float(exit_[1]))
 
                 f.write("\n".join(buf))
                 f.write("\n")
                 # Drop the layer's arrays before the next iteration (RPi4 RAM hygiene).
-                del segs, parts, p_seg, i_seg
+                del groups, p_seg, i_seg
 
             # ── Footer ──
             f.write("PRINT_END\n")
@@ -277,20 +315,25 @@ def generate_gcode_multi_origin(slices: list, infills: list, save_path: str,
                                 print_speed: float = 600.0,
                                 x_max: float = _BED_X_MAX,
                                 y_max: float = _BED_Y_MAX,
+                                z_max: float = _BED_Z_MAX,
                                 inter_well_lift: float = 2.0) -> int:
     """Ayni dilim verisini BIRDEN COK origin'e (well) basan tek-dosya G-code.
 
     generate_gcode() ile ayni segment-cikarma / greedy siralama / on-dogrulama
     yardimcilarini kullanir; tek fark AYNI modelin her ``origin`` (kuyu) icin
     tekrar basilmasidir. Sira LAYER-MAJOR: her Z icin once tum kuyular basilir,
-    sonra bir ust katmana gecilir (Z hep yukari).
+    sonra bir ust katmana gecilir. KATMANLAR arasi net ilerleme YUKARI dogrudur;
+    ANCAK kuyu gecisinde once z+lift'e CIKILIR, XY travel yapilir, sonra ayni
+    katmanin baski Z'sine geri INILIR (yani kuyu-ici gecis lift + descent icerir).
 
     Args:
         origins: ``[(well_id, origin_x, origin_y), ...]`` — origin_x/y Klipper
             yatak koordinatidir (yatak merkezi 120/60 + kuyu yerel ofseti).
         inter_well_lift: kuyu/katman gecisinde XY hareketinden ONCE uygulanan
             guvenli Z kalkis payi (mm). 2.0 = yazili dolgunun uzerinden gecer.
-            Z YALNIZCA yukari gider (sabit-yatak guvenligi korunur).
+            Bu bir LIFT'tir: z+lift'e cikilir, XY travel, sonra baski Z'sine geri
+            INILIR (kafa ayni katman Z'sine doner; "Z yalnizca yukari" DEGIL).
+            En ust katman icin (highest_z + lift) makine Z tavanini (z_max) asamaz.
         Diger argumanlar generate_gcode() ile aynidir.
 
     Returns:
@@ -328,6 +371,16 @@ def generate_gcode_multi_origin(slices: list, infills: list, save_path: str,
                 f"Y [{fy_min:.1f} .. {fy_max:.1f}] (izinli 0 .. {y_max:.0f}).\n"
                 "Daha kucuk bir model kullanin ya da bu kuyuyu secimden cikarin.")
 
+    # ── Z TAVAN KONTROLU (multi-origin: kuyu gecisinde en ust katman + lift'e cikilir) ──
+    hi = _highest_nonempty_layer(slices, infills)
+    highest_z = (hi + 1) * layer_height if hi >= 0 else 0.0
+    if highest_z + lift > z_max:
+        raise ValueError(
+            "Model yuksekligi (+kuyu gecis lift'i) makine Z sinirini asiyor:\n"
+            f"gereken Z {highest_z:.2f} + lift {lift:.1f} = {highest_z + lift:.2f} mm "
+            f"> izin {z_max:.1f} mm.\n"
+            "Daha alcak bir model kullanin, lift'i azaltin ya da katman sayisini dusurun.")
+
     tmp_path = save_path + ".tmp"
     try:
         with open(tmp_path, 'w', encoding='utf-8') as f:
@@ -340,50 +393,61 @@ def generate_gcode_multi_origin(slices: list, infills: list, save_path: str,
                 slc = slices[i] if i < len(slices) else None
                 inf = infills[i] if has_infills and i < len(infills) else None
 
-                parts = []
+                # PERIMETRE ONCE, sonra INFILL (tek NN havuzunda KARISMAZ). Bos katman atlanir.
                 p_seg = _segments_xy(slc)
-                if p_seg.shape[0]:
-                    parts.append(p_seg)
                 i_seg = _segments_xy(inf)
-                if i_seg.shape[0]:
-                    parts.append(i_seg)
-                if not parts:
+                if p_seg.shape[0] == 0 and i_seg.shape[0] == 0:
                     continue   # bos katman → hicbir kuyuda Z/baski yok
-                base_segs = parts[0] if len(parts) == 1 else np.concatenate(parts, axis=0)
                 z = (i + 1) * layer_height
 
                 # Bu katmanda SIRAYLA her kuyu (layer-major).
                 for wid, ox, oy in origins:
-                    segs = base_segs + np.array([ox, oy], dtype=np.float64)
+                    shift = np.array([ox, oy], dtype=np.float64)
+                    well_groups = []
+                    if p_seg.shape[0]:
+                        well_groups.append(p_seg + shift)   # perimetre
+                    if i_seg.shape[0]:
+                        well_groups.append(i_seg + shift)   # sonra infill
                     buf = [f"; LAYER {i} WELL {wid} (z={z:.3f})"]
                     well_started = False   # bu kuyunun ilk segmenti henuz basilmadi
-                    for entry, exit_, gap in _order_layer_segments(segs, cur_xy):
-                        if not first_descent_done:
-                            # TUM baskinin ilk segmenti: XY yaklasimini kalibrasyon
-                            # yuksekliginde yap, SONRA baski Z'sine in.
-                            buf.append(f"G0 X{entry[0]:.3f} Y{entry[1]:.3f} F{travel_feed:.0f}")
-                            buf.append(f"G0 Z{z:.3f} F600")
-                            first_descent_done = True
-                        elif not well_started:
-                            # Yeni kuyu/katman gecisi: ONCE guvenli Z (lift), SONRA
-                            # XY travel, SONRA baski Z'sine in — yazili dolgudan
-                            # gecmeyi onler (Z hep yukari; sabit-yatak guvenligi).
-                            buf.append(f"G0 Z{z + lift:.3f} F600")
-                            buf.append(f"G0 X{entry[0]:.3f} Y{entry[1]:.3f} F{travel_feed:.0f}")
-                            buf.append(f"G0 Z{z:.3f} F600")
-                        elif gap > _TRAVEL_THRESHOLD:
-                            buf.append(f"G0 X{entry[0]:.3f} Y{entry[1]:.3f} F{travel_feed:.0f}")
-                        well_started = True
-                        seg_len = math.hypot(exit_[0] - entry[0], exit_[1] - entry[1])
-                        e_val = seg_len * flow_multiplier
-                        buf.append(f"G1 X{exit_[0]:.3f} Y{exit_[1]:.3f} E{e_val:.4f} F{print_speed:.0f}")
-                        moves += 1
-                        cur_xy = (float(exit_[0]), float(exit_[1]))
+                    for grp in well_groups:   # [0]=perimetre, [1]=infill (varsa)
+                        for entry, exit_, gap in _order_layer_segments(grp, cur_xy):
+                            if not first_descent_done:
+                                # TUM baskinin ilk segmenti: XY yaklasimini kalibrasyon
+                                # yuksekliginde yap, SONRA baski Z'sine in.
+                                buf.append(f"G0 X{entry[0]:.3f} Y{entry[1]:.3f} F{travel_feed:.0f}")
+                                buf.append(f"G0 Z{z:.3f} F600")
+                                first_descent_done = True
+                            elif not well_started:
+                                # Yeni kuyu/katman gecisi: ONCE guvenli Z'ye CIK (z+lift),
+                                # SONRA XY travel, SONRA ayni katmanin baski Z'sine GERI IN.
+                                # NOT: bu bir lift + descent'tir; "Z hep yukari" DEGIL —
+                                # kuyu-ici gecis yazili dolgunun ustunden gecmek icin
+                                # yukselir, sonra baski yuksekligine doner.
+                                buf.append(f"G0 Z{z + lift:.3f} F600")
+                                buf.append(f"G0 X{entry[0]:.3f} Y{entry[1]:.3f} F{travel_feed:.0f}")
+                                buf.append(f"G0 Z{z:.3f} F600")
+                            elif gap > _TRAVEL_THRESHOLD:
+                                buf.append(f"G0 X{entry[0]:.3f} Y{entry[1]:.3f} F{travel_feed:.0f}")
+                            elif gap > 1e-6:
+                                # Sub-mm dikis: kafa segment ENTRY'sine ULASMALI → entry'ye
+                                # EKSTRUZE et (E = dikis uzunlugu). Eskiden dogrudan exit'e
+                                # cizilen G1 entry'yi atliyor + capraz geometri yapiyordu.
+                                buf.append(f"G1 X{entry[0]:.3f} Y{entry[1]:.3f} "
+                                           f"E{gap * flow_multiplier:.4f} F{print_speed:.0f}")
+                                moves += 1
+                                cur_xy = (float(entry[0]), float(entry[1]))
+                            well_started = True
+                            seg_len = math.hypot(exit_[0] - entry[0], exit_[1] - entry[1])
+                            e_val = seg_len * flow_multiplier
+                            buf.append(f"G1 X{exit_[0]:.3f} Y{exit_[1]:.3f} E{e_val:.4f} F{print_speed:.0f}")
+                            moves += 1
+                            cur_xy = (float(exit_[0]), float(exit_[1]))
 
                     f.write("\n".join(buf))
                     f.write("\n")
-                    del segs
-                del base_segs, parts, p_seg, i_seg
+                    del well_groups
+                del p_seg, i_seg
 
             # Footer TEK KEZ.
             f.write("PRINT_END\n")
