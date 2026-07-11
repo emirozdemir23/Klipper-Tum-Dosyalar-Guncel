@@ -1670,7 +1670,13 @@ class KlipperArayuzu(QWidget):
             pass
 
     def _local_preview_origins(self) -> list:
-        """Preview icin (well_id, cx, cy) yerel koordinatlar.
+        """Secili kuyularin yerel merkezleri: (well_id, cx, cy) listesi.
+
+        NOT: Preview ARTIK bu helper'i KULLANMAZ. Preview her zaman tek merkez
+        modeli (origin 0,0) gosterir; coklu-kuyu cogaltimi yalnizca Model
+        sekmesinde (_update_model_copies) ve G-code export'ta yasar. Export kendi
+        origin listesini _well_registry[wid]["center"]'dan kurar. Bu helper
+        genel bir kuyu-merkez yardimcisi olarak (ve testler icin) korunur.
 
         Petri/Glass ya da kuyu secilmemis -> [("", 0.0, 0.0)] (tek merkez).
         Well-plate + secili kuyular -> her kuyu icin yerel merkez.
@@ -2380,12 +2386,13 @@ class KlipperArayuzu(QWidget):
         # ghost plus a cheap first-layer footprint cap; the active layer is drawn
         # in full below.
         if idx != self._render_last_idx:
-            for _n in ('ghost', 'prev_p', 'prev_i', 'base_cap'):
+            for _n in ('ghost', 'preview_ghost', 'prev_p', 'prev_i', 'base_cap'):
                 _a = plotter.actors.get(_n)
                 if _a is not None:
                     plotter.remove_actor(_a, render=False)
 
-            # 1. Ghost of the full model (very faint, for context).
+            # 1. Ghost of the full model (very faint, for context). SINGLE, shared
+            #    (_original_mesh by reference — NO per-well copy, NO deep-copy).
             if self._original_mesh is not None:
                 # Ghost = tam modelin silueti (Z=0..toplam_yukseklik). Aktif katman
                 # artik plate'e (z~0.04) indirildigi icin ghost'un alt kismi onunla
@@ -2395,7 +2402,7 @@ class KlipperArayuzu(QWidget):
                     self._original_mesh,
                     color='#B0BEC5', opacity=0.03,
                     show_edges=False, lighting=True, smooth_shading=True,
-                    name='ghost', render=False,
+                    name='preview_ghost', render=False,
                 )
             # 2. First-layer footprint cap (build-plate adhesion hint). A flat
             #    bounding-box plane from the slice bounds — NOT delaunay_2d(),
@@ -2419,18 +2426,23 @@ class KlipperArayuzu(QWidget):
                     pass
             self._render_last_idx = idx
 
-        # ── 3. ACTIVE LAYER (full, instant) — well-plate'de secili her kuyuya kopya ─
-        # Onceki aktif aktorleri (tek + per-well) temizle: bos katman onceki
-        # katmanin cizgilerini ekranda birakmasin.
-        for _n in ('active_perimeter', 'infill_v'):
-            _a = plotter.actors.get(_n)
-            if _a is not None:
-                plotter.remove_actor(_a, render=False)
-        for _n in getattr(self, '_preview_well_actor_names', []):
-            _a = plotter.actors.get(_n)
-            if _a is not None:
-                plotter.remove_actor(_a, render=False)
-        self._preview_well_actor_names = []
+        # ── 3. ACTIVE LAYER (full, instant) — TEK MERKEZ KOPYA ──────────────
+        # Preview her ZAMAN tek modeli temsil eder: selected_wells KAC olursa
+        # olsun burada TEK aktif katman cizilir (local origin 0,0; XY translate
+        # YOK). Coklu-kuyu cogaltimi yalnizca Model sekmesinde ve G-code
+        # export'ta (generate_gcode_multi_origin) yasar — Preview'da DEGIL.
+        # Onceki kare(ler)den kalabilecek TUM aktif/legacy aktorleri temizle:
+        # sabit isimliler + eski per-well (active_perimeter_A1 / infill_A1 /
+        # ghost_A1) + eski 'infill_v'. Boylece slider hareketinde geometry birikmez.
+        for _nm in list(plotter.actors.keys()):
+            if (_nm in ('active_perimeter', 'active_infill', 'infill_v')
+                    or _nm.startswith('active_perimeter_')
+                    or _nm.startswith('infill_')
+                    or _nm.startswith('ghost_')):
+                _a = plotter.actors.get(_nm)
+                if _a is not None:
+                    plotter.remove_actor(_a, render=False)
+        self._preview_well_actor_names = []   # legacy alan; artik kullanilmiyor
 
         # Symmetric bounds guards: worker _layer_meshes / _slices / _infills'i AYNI
         # uzunlukta uretir; yine de her erisimi koruyoruz (bos kare, asla IndexError).
@@ -2439,27 +2451,17 @@ class KlipperArayuzu(QWidget):
         infill = self._infills[idx] if idx < len(self._infills) else None
 
         if active is not None and getattr(active, 'n_points', 0) > 0:
-            # Petri/Glass -> [("", 0, 0)] (tek merkez); Well-plate -> secili kuyular.
-            # Ayni dilim verisi kuyulara TRANSLATE edilerek cogaltilir (yeniden slice yok).
-            for well_id, cx, cy in self._local_preview_origins():
-                p_name = f'active_perimeter_{well_id}' if well_id else 'active_perimeter'
-                i_name = f'infill_{well_id}' if well_id else 'infill_v'
-                # Preview-only: aktif katmani gercek Z'sinden (idx*layer_h) build
-                # plate ustune indiriyoruz ki havada durmasin. Helper HER ZAMAN
-                # deep-copy dondurur → G-code/slice verisi degismez. Perimeter ve
-                # infill'e minik Z farki (0.04 / 0.05) veriyoruz ki cakismasinlar.
-                if slc is not None and slc.n_points > 0:
-                    slc_c = self._flatten_polydata_for_preview(slc, z_preview=0.04)
-                    if cx or cy:
-                        slc_c.translate((cx, cy, 0.0), inplace=True)  # sadece XY
-                    self._add_filament(plotter, slc_c, 0.2, '#FF0000', p_name)
-                    self._preview_well_actor_names.append(p_name)
-                if infill is not None and getattr(infill, 'n_points', 0) > 0:
-                    inf_c = self._flatten_polydata_for_preview(infill, z_preview=0.05)
-                    if cx or cy:
-                        inf_c.translate((cx, cy, 0.0), inplace=True)  # sadece XY
-                    self._add_filament(plotter, inf_c, 0.15, '#FF8C00', i_name)
-                    self._preview_well_actor_names.append(i_name)
+            # Preview-only: aktif katmani gercek Z'sinden (idx*layer_h) build plate
+            # ustune indiriyoruz ki havada durmasin. Helper HER ZAMAN deep-copy
+            # dondurur → G-code/slice verisi degismez. Perimeter ve infill'e minik
+            # Z farki (0.04 / 0.05) veriyoruz ki cakismasinlar. XY TRANSLATE YOK →
+            # slice zaten (0,0) merkezli; ghost ile ayni koordinat sisteminde durur.
+            if slc is not None and slc.n_points > 0:
+                slc_c = self._flatten_polydata_for_preview(slc, z_preview=0.04)
+                self._add_filament(plotter, slc_c, 0.2, '#FF0000', 'active_perimeter')
+            if infill is not None and getattr(infill, 'n_points', 0) > 0:
+                inf_c = self._flatten_polydata_for_preview(infill, z_preview=0.05)
+                self._add_filament(plotter, inf_c, 0.15, '#FF8C00', 'active_infill')
 
         # ── SINGLE RENDER CALL ──────────────────────────────────────────────
         if self.layer_plotter.interactor.isVisible():

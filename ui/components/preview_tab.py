@@ -70,11 +70,18 @@ class PreviewTab(QWidget):
         # BOTTOM and dragging/scrolling UP INCREASES the layer — like Cura.
         self.layer_slider.setInvertedAppearance(False)
         self.layer_slider.setInvertedControls(False)
+        # FILL yonu (bu PyQt6 derlemesinde: dikey slider + invertedAppearance=False):
+        #   add-page:vertical = handle'in ALTI (alt/min tarafa dogru) -> MAVI (dolu)
+        #   sub-page:vertical = handle'in USTU (ust/max tarafa dogru) -> ACIK GRI (bos)
+        # Naif QSS dokumani tersini ima eder; GERCEK screenshot ile dogrulandi.
+        # invertedAppearance/Controls FALSE kalir → deger yonu (yukari = artan katman)
+        # BOZULMAZ; yalnizca dolgu rengi handle'in ALTINA alinir.
         self.layer_slider.setStyleSheet(
             "QSlider::groove:vertical {"
             "  width:6px; background:#E0E0E0; border-radius:3px;"
             "}"
-            f"QSlider::sub-page:vertical {{ background:{_ACCENT}; border-radius:3px; }}"
+            f"QSlider::add-page:vertical {{ background:{_ACCENT}; border-radius:3px; }}"
+            "QSlider::sub-page:vertical { background:#E0E0E0; border-radius:3px; }"
             "QSlider::handle:vertical {"
             "  height:18px; width:18px; margin:0 -7px;"
             f"  background:#FFFFFF; border-radius:9px; border:2px solid {_ACCENT}; }}"
