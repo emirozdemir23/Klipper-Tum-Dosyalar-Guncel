@@ -1473,7 +1473,8 @@ class KlipperArayuzu(QWidget):
             "STL Files (*.stl);;All Files (*)"
         )
         if path:
-            self.stl_dosya_yolu = path
+            # stl_dosya_yolu, YALNIZCA _show_stl icinde basarili okuma+dogrulama
+            # sonrasi atanir → gecersiz/okunamayan STL eski yolu bozmaz.
             self._show_stl(path)
 
     def _current_container_spec(self):
@@ -1716,75 +1717,128 @@ class KlipperArayuzu(QWidget):
                 origins.append((wid, float(cx), float(cy)))
         return origins
 
+    def _invalidate_slice_state_for_new_model(self) -> None:
+        """Yeni STL BASARIYLA yuklendiginde eski Preview/Slice/Export state'ini
+        TAMAMEN gecersiz kilar.
+
+        YALNIZCA basarili + dogrulanmis model degisiminde cagrilir (Cancel / okuma
+        hatasi / gecersiz STL'de CAGRILMAZ — o durumlarda eski durum korunur).
+        Model sekmesindeki plotter'a (self.plotter) DOKUNMAZ; yalnizca Preview
+        (self.layer_plotter) sahnesi temizlenir. Kullanici yeni model icin YENIDEN
+        Slice yapana kadar Preview bos, slider + Export pasif kalir; eski G-code
+        path'i temizlendiginden Print de eski G-code'u basamaz.
+        """
+        # 1) Slice/preview veri seti + render onbellegi
+        self._slices = []
+        self._infills = []
+        self._layer_meshes = []
+        self._all_layers_mesh = None
+        self._original_mesh = None            # Preview ghost kaynagi (re-slice'ta dolar)
+        self._current_layer_idx = 0
+        self._last_plate_size = None          # Preview static sahne yeniden kurulsun
+        self._render_last_idx = -1
+        self._preview_well_actor_names = []
+
+        # 2) Slice + export snapshot / son G-code → Print & Export "dirty" (bloke)
+        self._slice_snapshot = None
+        self._pending_slice_snapshot = None
+        self._export_snapshot = None
+        self._last_gcode_path = None
+        self._last_gcode_filename = None
+
+        # 3) Preview 3D sahnesini TAMAMEN temizle (eski ghost + aktif katman + plate).
+        #    YALNIZCA layer_plotter; Model plotter'a DOKUNMA. Hic slice yapilmadiysa
+        #    (layer_plotter None) no-op.
+        if getattr(self, 'layer_plotter', None) is not None:
+            try:
+                self.layer_plotter.clear()
+            except Exception:
+                pass
+            try:
+                if self.layer_plotter.interactor.isVisible():
+                    self.layer_plotter.render()
+            except Exception:
+                pass
+
+        # 4) Slider: bos duruma al + yeni Slice'a kadar DISABLED.
+        if getattr(self, 'layer_slider', None) is not None:
+            self.layer_slider.blockSignals(True)
+            self.layer_slider.setMinimum(0)
+            self.layer_slider.setMaximum(0)
+            self.layer_slider.setValue(0)
+            self.layer_slider.blockSignals(False)
+            self.layer_slider.setEnabled(False)
+
+        # 5) Katman etiketi bos duruma (PreviewTab baslangic metniyle ayni).
+        if getattr(self, 'layer_nav_label', None) is not None:
+            self.layer_nav_label.setText("— / —")
+
+        # 6) Export butonu: yeni Slice'a kadar DISABLED.
+        if getattr(self, 'export_gcode_btn', None) is not None:
+            self.export_gcode_btn.setEnabled(False)
+
+    def _draw_model_scene(self, mesh, plate_size: float = 150.0) -> None:
+        """Model sekmesi sahnesini (self.plotter) sifirdan cizer: baski tablasi +
+        grid + kuyu-merkez registry + referans kap + model kopyalari + isik + eksen
+        + kamera. Cagiran ONCE self.plotter.clear() yapmis ve _loaded_model_mesh'i
+        atamis olmalidir. Transactional yukleme HEM yeni model HEM rollback'te AYNI
+        sahne kurulumunu kullanir (tek kaynak)."""
+        self.plotter.add_mesh(
+            pv.Plane(center=(0, 0, -0.05), direction=(0, 0, 1),
+                     i_size=plate_size, j_size=plate_size),
+            color="#F8F8F8", show_edges=False, lighting=False,
+        )
+        build_platform_grid(self.plotter, plate_size, z_grid=0.01)
+        # KUYU MERKEZ KAYDI (Preview/export icin; SADECE VERI)
+        self._rebuild_well_registry()
+        # REFERANS KAP (SALT-GORSEL: hitbox YOK, mesh-picking YOK)
+        self._draw_container()
+        # MODEL KOPYALARI (petri/glass=merkez; well-plate=secili kuyular)
+        self._update_model_copies()
+        # AYDINLATMA
+        self.plotter.remove_all_lights()
+        headlight = pv.Light(light_type='headlight')
+        headlight.intensity = 0.85
+        self.plotter.add_light(headlight)
+        # EKSENLER + etiketleri
+        axis_origin = [-plate_size / 2, -plate_size / 2, 0]
+        build_axis_arrows(self.plotter, axis_origin, length=20)
+        label_pts = [
+            [axis_origin[0] + 26, axis_origin[1], axis_origin[2]],
+            [axis_origin[0], axis_origin[1] + 26, axis_origin[2]],
+            [axis_origin[0], axis_origin[1], axis_origin[2] + 26],
+        ]
+        for pt, lbl, clr in zip(label_pts, ["X", "Y", "Z"],
+                                ["#F44336", "#4CAF50", "#2196F3"]):
+            self.plotter.add_point_labels(
+                [pt], [lbl], text_color=clr, font_size=12,
+                bold=True, point_size=0, shape=None, always_visible=True,
+            )
+        # KAMERA
+        self.plotter.camera_position = 'iso'
+        self.plotter.reset_camera()
+        try:
+            self.plotter.camera.elevation = 22
+        except Exception:
+            pass
+        self.plotter.camera.zoom(1.15)
+        try:
+            self.plotter.reset_camera_clipping_range()
+        except Exception:
+            pass
+
     def _show_stl(self, path: str) -> None:
         if pv is None or QtInteractor is None or self.uc_boyutlu_alan is None:
             return
 
-        # Uçuşta bir dilimleme varsa: sonucu artık YANLIŞ modele ait olacak.
-        # Bayatla (geç gelen finished saklanmadan atılır) + işbirlikçi iptal iste
-        # (worker blok sınırlarında bayrağı görüp 'aborted' ile erken döner).
-        if self._slicing:
-            self._slice_stale = True
-            try:
-                if self._slice_worker is not None:
-                    self._slice_worker.request_abort()
-            except Exception:
-                pass
-
+        # ── PREPARE — STL'yi OKU + DOGRULA + merkezle. HICBIR state'e/sahneye
+        #    DOKUNMAZ. Dialog-Cancel / dosya yok / pv.read hatasi / bos-gecersiz
+        #    mesh / buyuk-dosya "No" → erken don: eski model + Preview/Slice/Export
+        #    TAMAMEN korunur, CALISAN Slice DEVAM eder (abort/stale YOK; TEK okuma).
         try:
-            if self.plotter is None:
-                lay = self.uc_boyutlu_alan.layout()
-                if lay:
-                    while lay.count():
-                        it = lay.takeAt(0)
-                        if it.widget():
-                            it.widget().deleteLater()
-                else:
-                    self.uc_boyutlu_alan.setLayout(QVBoxLayout())
-
-                self.uc_boyutlu_alan.setStyleSheet(
-                    "QFrame{background:#EBEBEB;border:2px solid #BDBDBD;border-radius:6px;}"
-                )
-                self.plotter = QtInteractor(self.uc_boyutlu_alan)
-                self.uc_boyutlu_alan.layout().addWidget(self.plotter.interactor)
-
-                # NOT: Model sekmesi artik SALT-GORUNTULEME. Onceden burada
-                # enable_mesh_picking (well hitbox tiklama -> model kopyala/sil)
-                # kuruluyordu; KALDIRILDI. Kuyu secimi YALNIZCA Built Platform
-                # sekmesinden yapilir. Bu sekme sadece "actigim STL nasil
-                # gorunuyor?" sorusuna cevap verir; hicbir kuyu/hitbox cizilmez.
-
-            # Eski sahneyi ve TÜM slice/preview durumunu temizle: aksi halde
-            # önceki modelin ghost'u, cache'leri ve VTK aktörleri bellekte kalır.
-            self.plotter.clear()
-            try:
-                self.plotter.clear_actors()
-            except Exception:
-                pass
-            self._slices = []
-            self._layer_meshes = []
-            self._infills = []
-            self._all_layers_mesh = None
-            self._original_mesh = None
-            self._loaded_model_mesh = None
-            self._well_model_actor_names = []
-            self._current_layer_idx = 0
-            self._last_plate_size = None
-            # Önizleme durumunu sıfırla: yeni model dilimlenene kadar eski
-            # slider/önbellek kalmasın.
-            self._render_last_idx = -1
-            if getattr(self, 'layer_slider', None) is not None:
-                self.layer_slider.blockSignals(True)
-                self.layer_slider.setMaximum(0)
-                self.layer_slider.setValue(0)
-                self.layer_slider.blockSignals(False)
-            self.plotter.set_background("#F0F0F0")
-
-            # Dosya hâlâ var mı? (seçimden sonra taşınmış/silinmiş olabilir)
             p = Path(path)
             if not p.exists():
                 raise FileNotFoundError(f"File not found:\n{path}")
-            # Çok büyük dosyalar için yumuşak uyarı (OOM riski) — yine de devam.
             try:
                 size_mb = p.stat().st_size / (1024 * 1024)
             except OSError:
@@ -1797,83 +1851,80 @@ class KlipperArayuzu(QWidget):
                     QMessageBox.StandardButton.Yes | QMessageBox.StandardButton.No,
                 )
                 if reply != QMessageBox.StandardButton.Yes:
-                    return
-
-            # STL'yi oku
+                    return   # iptal → hicbir sey degismedi
             mesh = pv.read(path)
             if mesh is None or getattr(mesh, 'n_points', 0) == 0:
                 raise ValueError("STL file contains no geometry")
-
-            # Modeli X,Y'de ortala, Z'de altını platforma (Z=0) oturt
             z_min = mesh.bounds[4]
             center_xy = mesh.center[:2]
             mesh = mesh.translate((-center_xy[0], -center_xy[1], -z_min))
+        except Exception as e:
+            # PREPARE hatasi: hicbir sey degismedi (abort/stale/temizleme YOK).
+            QMessageBox.critical(self, "STL Error", f"Could not load STL:\n{e}")
+            return
 
-            # --- BASKI TABLASI (Cura stili) ---
-            plate_size = 150
-
-            self.plotter.add_mesh(
-                pv.Plane(center=(0, 0, -0.05), direction=(0, 0, 1),
-                         i_size=plate_size, j_size=plate_size),
-                color="#F8F8F8", show_edges=False, lighting=False,
-            )
-            build_platform_grid(self.plotter, plate_size, z_grid=0.01)
-
-            # --- MODEL --- Tek aktor yerine memory'de sakla; sahneye kopyalar
-            # _update_model_copies() ile eklenir (petri/glass=merkez, well-plate=
-            # secili kuyu sayisi kadar). Her kuyu icin dosyadan TEKRAR okunmaz.
+        # ── COMMIT (Model sahnesi) — eski MODEL alanlarini yerel snapshot'a al; yeni
+        #    modeli ata + Model sahnesini kur. Kurulum HATA verirse ROLLBACK: MODEL
+        #    alanlarini geri yukle + eski sahneyi best-effort yeniden ciz. Bu asamada
+        #    Preview/Slice/Export'a HENUZ DOKUNULMADI → onlar zaten korunur; abort YOK.
+        _old_stl = self.stl_dosya_yolu
+        _old_mesh = self._loaded_model_mesh
+        _old_well_names = list(getattr(self, '_well_model_actor_names', []))
+        try:
+            if self.plotter is None:
+                lay = self.uc_boyutlu_alan.layout()
+                if lay:
+                    while lay.count():
+                        it = lay.takeAt(0)
+                        if it.widget():
+                            it.widget().deleteLater()
+                else:
+                    self.uc_boyutlu_alan.setLayout(QVBoxLayout())
+                self.uc_boyutlu_alan.setStyleSheet(
+                    "QFrame{background:#EBEBEB;border:2px solid #BDBDBD;border-radius:6px;}"
+                )
+                self.plotter = QtInteractor(self.uc_boyutlu_alan)
+                self.uc_boyutlu_alan.layout().addWidget(self.plotter.interactor)
+                # NOT: Model sekmesi SALT-GORUNTULEME; mesh-picking/hitbox YOK.
+            self.plotter.clear()
+            try:
+                self.plotter.clear_actors()
+            except Exception:
+                pass
+            self.plotter.set_background("#F0F0F0")
+            self.stl_dosya_yolu = path
             self._loaded_model_mesh = mesh
             self._model_actor = None
-
-            # --- KUYU MERKEZ KAYDI (Preview/export icin; SADECE VERI) ---
-            self._rebuild_well_registry()
-
-            # --- REFERANS KAP (SALT-GORSEL: hitbox YOK, mesh-picking YOK) ---
-            # Modellerin hangi kuyularda oldugu gorunsun diye footprint + kuyu
-            # wireframe'leri cizilir; hicbir aktor pickable degildir.
-            self._draw_container()
-
-            # --- MODEL KOPYALARI (petri/glass=merkez; well-plate=secili kuyular) ---
-            self._update_model_copies()
-
-            # --- AYDINLATMA ---
-            self.plotter.remove_all_lights()
-            headlight = pv.Light(light_type='headlight')
-            headlight.intensity = 0.85
-            self.plotter.add_light(headlight)
-
-            # --- EKSENLER ---
-            axis_origin = [-plate_size / 2, -plate_size / 2, 0]
-            build_axis_arrows(self.plotter, axis_origin, length=20)
-
-            # Eksen etiketleri
-            label_pts = [
-                [axis_origin[0] + 26, axis_origin[1], axis_origin[2]],
-                [axis_origin[0], axis_origin[1] + 26, axis_origin[2]],
-                [axis_origin[0], axis_origin[1], axis_origin[2] + 26],
-            ]
-            for pt, lbl, clr in zip(label_pts, ["X", "Y", "Z"],
-                                    ["#F44336", "#4CAF50", "#2196F3"]):
-                self.plotter.add_point_labels(
-                    [pt], [lbl], text_color=clr, font_size=12,
-                    bold=True, point_size=0, shape=None, always_visible=True,
-                )
-
-            # --- KAMERA ---
-            self.plotter.camera_position = 'iso'
-            self.plotter.reset_camera()
-            try:
-                self.plotter.camera.elevation = 22
-            except Exception:
-                pass
-            self.plotter.camera.zoom(1.15)
-            try:
-                self.plotter.reset_camera_clipping_range()
-            except Exception:
-                pass
-
+            self._well_model_actor_names = []
+            self._draw_model_scene(mesh)
         except Exception as e:
-            QMessageBox.critical(self, "STL Error", f"Could not load STL:\n{e}")
+            # ── ROLLBACK: Model sahnesi kurulamadi → MODEL state'ini geri al ve eski
+            #    Model sahnesini best-effort yeniden ciz. Preview/Slice/Export
+            #    invalidate EDILMEDIGI icin onlar zaten ESKI degerinde (korunur).
+            self.stl_dosya_yolu = _old_stl
+            self._loaded_model_mesh = _old_mesh
+            self._well_model_actor_names = _old_well_names
+            if getattr(self, 'plotter', None) is not None and _old_mesh is not None:
+                try:
+                    self.plotter.clear()
+                    self._draw_model_scene(_old_mesh)
+                except Exception:
+                    pass
+            QMessageBox.critical(self, "STL Error",
+                                 f"Model sahnesi kurulamadi (eski model korundu):\n{e}")
+            return
+
+        # ── COMMIT BASARILI → yeni model KESIN kabul edildi. Simdi (ve YALNIZCA
+        #    simdi) eski Preview/Slice/Export state'ini GECERSIZ kil; ucustaki (artik
+        #    yanlis modele ait) dilimlemeyi bayatla + TAM BIR KEZ iptal et.
+        self._invalidate_slice_state_for_new_model()
+        if self._slicing:
+            self._slice_stale = True
+            try:
+                if self._slice_worker is not None:
+                    self._slice_worker.request_abort()
+            except Exception:
+                pass
 
     # ==========================================================
     # SLICE
@@ -2122,7 +2173,12 @@ class KlipperArayuzu(QWidget):
                 self.layer_slider.setMaximum(top)
                 self.layer_slider.setValue(0)      # Layer 1 (alt)
                 self.layer_slider.blockSignals(False)
+                # Yeni slice hazir → model degisiminde pasiflenen slider tekrar aktif.
+                self.layer_slider.setEnabled(True)
             self._current_layer_idx = 0
+            # Export butonu da tekrar kullanilabilir (model degisiminde pasiflenmisti).
+            if getattr(self, 'export_gcode_btn', None) is not None:
+                self.export_gcode_btn.setEnabled(True)
 
             # 6. GL penceresi hazırlanması için 150 ms bekle, sonra ilk katmanı göster.
             QTimer.singleShot(150, lambda: self._show_layer(0))
