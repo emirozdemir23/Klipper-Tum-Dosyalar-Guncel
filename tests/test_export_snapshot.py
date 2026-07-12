@@ -53,6 +53,27 @@ def run():
     w.platform_tab.well_buttons["B3"].setChecked(False)  # back to A1
     c.chk("restore well selection -> export not dirty", w._export_is_dirty() is False)
 
+    # --- Test 7: change well selection, RE-EXPORT -> NOT dirty AND snapshot captures new origins ---
+    w.platform_tab.well_buttons["B3"].setChecked(True)          # A1+B3
+    c.chk("Test7 well changed -> export DIRTY before re-export", w._export_is_dirty() is True)
+    g7 = tempfile.NamedTemporaryFile(suffix=".gcode", delete=False); g7.close()
+    QFileDialog.getSaveFileName = staticmethod(lambda *a, **k: (g7.name, ""))
+    QMessageBox.information = staticmethod(lambda *a, **k: None)
+    w._on_export_gcode()
+    c.chk("Test7 re-export with new wells -> export NOT dirty", w._export_is_dirty() is False)
+    c.chk("Test7 snapshot captured new origins (2 wells)",
+          w._export_snapshot is not None
+          and w._export_snapshot.get("origins", (None,))[0] == "well"
+          and len(w._export_snapshot["origins"][1]) == 2,
+          str(w._export_snapshot.get("origins")) if w._export_snapshot else "None")
+    # restore A1-only export pointing back at the original file (keeps later deletions/tamper tests valid)
+    w.platform_tab.well_buttons["B3"].setChecked(False)
+    QFileDialog.getSaveFileName = staticmethod(lambda *a, **k: (gcode.name, ""))
+    w._on_export_gcode()
+    c.chk("Test7 restore A1 + re-export -> export NOT dirty", w._export_is_dirty() is False)
+    try: os.unlink(g7.name)
+    except OSError: pass
+
     # --- printhead / tool change -> export dirty ---
     if w.ph_buton_grubu:
         w.ph_buton_grubu.button(2).setChecked(True)      # Printhead 2 -> T1
