@@ -446,15 +446,25 @@ class SliceWorker(QObject):
             master_grid = None
             if self._distance and self._distance > 0:
                 master_grid = _build_master_grid(mesh.bounds, self._distance)
-                # Infill ISTENDI (distance>0) ama izgara kurulamadi (Grid Distance cok
-                # kucuk -> segment guvenlik sinirini asti, ya da model sinirlari
-                # gecersiz). Slice SESSIZCE infill'siz TAMAMLANMAZ: hata ver, finished ATMA.
-                # (Aksi halde "tamamen infills=None" bir slice basarili gorunurdu.)
+                # Infill ISTENDI (distance>0) ama izgara kurulamadi. Slice SESSIZCE
+                # infill'siz TAMAMLANMAZ (kullanicinin bilincli "infill kapat" secenegi
+                # yok): hata ver, finished ATMA. NEDEN ayrimi kullaniciya dogru cozumu
+                # gosterir:
+                #  (a) model XY sinirlari dejenere / NaN-Inf -> modelde sorun var,
+                #  (b) izgara cok yogun (segment guvenlik siniri asildi) -> Grid
+                #      Distance buyutulmeli.
                 if master_grid is None:
-                    self.error.emit(
-                        "Infill icin tarama izgarasi olusturulamadi.\n"
-                        "Grid Distance cok kucuk (guvenlik sinirini asti) ya da model "
-                        "sinirlari gecersiz. Grid Distance'i buyutun veya modeli kontrol edin.")
+                    b = mesh.bounds
+                    bounds_ok = (all(math.isfinite(v) for v in b[:4])
+                                 and b[1] > b[0] and b[3] > b[2])
+                    if not bounds_ok:
+                        self.error.emit(
+                            "Model sinirlari gecersiz (dejenere ya da NaN/Inf); Linear "
+                            "dolgu izgarasi olusturulamadi. Modeli kontrol edin.")
+                    else:
+                        self.error.emit(
+                            "Linear dolgu izgarasi cok yogun: Grid Distance cok kucuk "
+                            "(guvenlik siniri asildi). Grid Distance degerini artirin.")
                     return
             ng = 0 if master_grid is None else (master_grid[0].size + master_grid[1].size)
             print(f"[SLICE-PROF] master_grid: {time.perf_counter()-t0:.3f}s (lines={ng})", flush=True)

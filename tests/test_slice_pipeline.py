@@ -42,17 +42,35 @@ def run():
               any(s is not None and getattr(s, 'n_points', 0) > 0 for s in cap["slices"]))
 
     # ---- master_grid=None (Feature 2): Linear infill requested but grid unbuildable ----
-    # normal grid -> success (healthy slice above already covers this)
-    c.chk("normal grid -> finished OK", "slices" in slice_mesh(box, 0.2, 0.4))
+    # 1) normal grid -> success AND infill actually present (not a silent infill-less slice)
+    cap = slice_mesh(box, 0.2, 0.4)
+    c.chk("normal grid -> finished OK", "slices" in cap)
+    c.chk("normal grid -> infill present (>=1 non-empty infill layer)",
+          "infills" in cap and any(f is not None and getattr(f, "n_points", 0) > 0
+                                    for f in cap["infills"]))
 
-    # tiny distance trips the segment safety ceiling -> _build_master_grid None -> ERROR
+    # 2) tiny distance trips the segment safety ceiling -> too-dense -> ERROR (no finished),
+    #    message must tell the user to INCREASE Grid Distance.
     cap = slice_mesh(box, 0.2, 0.0001)
-    c.chk("tiny distance (safety ceiling) -> error", "error" in cap, cap.get("error", "")[:50])
+    c.chk("tiny distance (safety ceiling) -> error", "error" in cap, cap.get("error", "")[:60])
     c.chk("tiny distance -> NO finished", "slices" not in cap)
-    c.chk("tiny-distance error mentions grid/izgara", "error" in cap and
-          ("izgara" in cap["error"].lower() or "grid" in cap["error"].lower()))
+    c.chk("tiny-distance error suggests increasing Grid Distance",
+          "error" in cap and "grid distance" in cap["error"].lower()
+          and ("artir" in cap["error"].lower() or "buyu" in cap["error"].lower()),
+          cap.get("error", "")[:80])
 
-    # monkeypatch _build_master_grid -> None with a valid distance -> ERROR, no finished
+    # 3) degenerate XY bounds (zero X extent) -> master_grid None via bounds-invalid branch
+    #    -> ERROR (never a finished infill-less slice); distinct 'model bounds invalid' msg.
+    sliver = pv.Box(bounds=(0, 0, -6, 6, 0, 10)).triangulate()
+    cap = slice_mesh(sliver, 0.2, 0.4)
+    c.chk("degenerate XY bounds -> error", "error" in cap, cap.get("error", "")[:70])
+    c.chk("degenerate XY bounds -> NO finished", "slices" not in cap)
+    c.chk("degenerate-bounds error names model bounds (not just density)",
+          "error" in cap and ("sinir" in cap["error"].lower() or "dejenere" in cap["error"].lower()),
+          cap.get("error", "")[:80])
+
+    # 4) monkeypatch _build_master_grid -> None with a valid distance -> ERROR, no finished,
+    #    and NO silent infill-less success (neither 'slices' nor 'infills').
     orig_bmg = SW._build_master_grid
     SW._build_master_grid = lambda *a, **k: None
     try:
@@ -61,6 +79,7 @@ def run():
         SW._build_master_grid = orig_bmg
     c.chk("master_grid=None (monkeypatch) -> error", "error" in cap)
     c.chk("master_grid=None -> finished NOT emitted", "slices" not in cap)
+    c.chk("master_grid=None -> no infill-less success", "slices" not in cap and "infills" not in cap)
 
     # ---- Grid Distance invalid (Feature 4): None/0/negatif/NaN/Inf -> slice ERROR ----
     for dval, tag in ((0.0, "0"), (-1.0, "-1"),
