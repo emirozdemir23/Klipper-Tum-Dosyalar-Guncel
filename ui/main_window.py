@@ -64,6 +64,16 @@ class _MoonrakerBridge(QObject):
     polled = pyqtSignal(object)  # R3: 5 sn'lik durum yoklamasi sonucu (dict)
     # G-code upload sonucu (arka plan thread'den GUI'ye): (success, filename_or_empty, message)
     gcode_upload_finished = pyqtSignal(bool, str, str)
+    # M1 + runtime race: START/STOP teslim sonucu (arka plan thread'den GUI'ye):
+    # (token, ok, mesaj). token = ilgili cihazin komut EPOCH'u; result handler,
+    # token != guncel epoch ise sonucu STALE sayar ve UI/state'e DOKUNMAZ (eski
+    # callback yeni istegi ezmesin). Timer YALNIZCA ok=True + GUNCEL token ile baslar.
+    uv_start_finished = pyqtSignal(int, bool, str)
+    hepa_start_finished = pyqtSignal(int, bool, str)
+    # STOP teslim sonucu (token'li): 200 → UI idle + confirmed OFF; hata → UI tam
+    # idle'a DONMEZ ("STOP failed / STATE?") + banner (fiziksel cikis ACIK olabilir).
+    uv_stop_finished = pyqtSignal(int, bool, str)
+    hepa_stop_finished = pyqtSignal(int, bool, str)
 
 
 class KlipperArayuzu(QWidget):
@@ -86,7 +96,29 @@ class KlipperArayuzu(QWidget):
         """Ensure VTK renderers are safely closed before application exit to prevent SegFaults."""
         # Bu bayrak, kapanış sırasında kuyrukta kalan slice sinyallerinin
         # silinmiş widget'lara dokunmasını engeller (_on_slice_*, _show_layer).
+        # Ayrica gec gelen START teslim onaylari (_on_*_start_finished) timer
+        # baslatmasin diye ILK is olarak set edilir.
+        was_closing = self._closing
         self._closing = True
+
+        # C1/H1: aktif (ya da START ucustaki) UV/HEPA cikislarini FIZIKSEL kapanma
+        # icin durdur + STOP'u KISA/BOUNDED sekilde teslim etmeye calis. YALNIZCA
+        # ilk closeEvent'te (idempotent): ikinci cagri ayni STOP'u TEKRAR gondermez.
+        # Hata closeEvent'i asla kesmez (teardown devam etmeli).
+        if not was_closing:
+            # Kapanis = "hicbir cikis ACIK kalmasin" niyeti. desired_on'u dusur ve
+            # epoch'lari ilerlet: ucustaki TUM START/STOP worker'larinin token'lari
+            # boylece BAYATLAR — gec donen bir sonuc yikilmakta olan widget'lara
+            # dokunamaz. start_inflight BILEREK temizlenmez: worker gercekten hala
+            # ucusta olabilir ve asagidaki aktiflik kontrolu bunu bilmek zorunda.
+            self._uv_desired_on = False
+            self._hepa_desired_on = False
+            self._uv_command_epoch += 1
+            self._hepa_command_epoch += 1
+            try:
+                self._safe_stop_sterilization_on_close()
+            except Exception as exc:
+                print(f"[CLOSE] sterilizasyon guvenli-kapatma hatasi (yutuldu): {exc}")
 
         # R3: durum yoklamasini durdur (yikim sirasinda yeni tick gelmesin;
         # ucustaki son yoklama _closing kontrolune takilip zararsiz duser).
@@ -427,6 +459,36 @@ class KlipperArayuzu(QWidget):
         self.uv_kalan_saniye: int = 0
         self.hepa_timer: Optional[QTimer] = None
         self.hepa_kalan_saniye: int = 0
+        # M1: START teslimi DOGRULANANA kadar timer BASLAMAZ. inflight = START
+        # ucusta (cift-tik + kapanis-STOP kapsami icin); pending_seconds = teslim
+        # onaylaninca baslatilacak sure.
+        self._uv_start_inflight: bool = False
+        self._hepa_start_inflight: bool = False
+        self._uv_pending_seconds: int = 0
+        self._hepa_pending_seconds: int = 0
+        # Item 5: "confirmed command DELIVERY state" — HTTP 200 START ile True, HTTP
+        # 200 STOP ile False; STOP basarisizsa True/unknown korunur. FIZIKSEL sensor
+        # geri-beslemesi DEGIL; yalnizca son dogrulanan TESLIM durumu (kapanista
+        # aktiflik kontrolu bunu da dikkate alir).
+        self._uv_output_confirmed_on: bool = False
+        self._hepa_output_confirmed_on: bool = False
+        # --- Runtime race/state (v3) ---
+        # desired_on: kullanicinin EN SON istedigi durum. Ucustaki bir START worker'i
+        # teslimden SONRA bunu okur: artik False ise (kullanici bu arada Stop'a bastiysa)
+        # START'i basarili saymaz ve telafi STOP'u gonderir.
+        self._uv_desired_on: bool = False
+        self._hepa_desired_on: bool = False
+        # command_epoch: cihaz basina MONOTON istek token'i; her yeni Start/Stop (ve
+        # closeEvent) artirir. Worker teslim sonucunu KENDI token'iyla emit eder; sonuc
+        # handler'i token != guncel epoch ise sonucu STALE sayip DOKUNMADAN doner —
+        # boylece gec gelen eski callback, daha yeni istegin state'ini EZEMEZ.
+        self._uv_command_epoch: int = 0
+        self._hepa_command_epoch: int = 0
+        # stop_inflight: ayni cihaz icin IKINCI es-zamanli STOP worker'ini engeller
+        # (cift-tik; timer-timeout + kullanici Stop ayni turda). Guard YALNIZCA guncel
+        # istegi kapsar: sonuc dondugunde temizlenir → basarisiz STOP retry edilebilir.
+        self._uv_stop_inflight: bool = False
+        self._hepa_stop_inflight: bool = False
 
         # Print Timer
         self.print_timer: Optional[QTimer] = None
@@ -493,6 +555,12 @@ class KlipperArayuzu(QWidget):
         self._moonraker_bridge.recovered.connect(self._on_moonraker_recovered)
         # Arka plan G-code upload sonucu GUI thread'inde islenir (queued sinyal).
         self._moonraker_bridge.gcode_upload_finished.connect(self._on_gcode_upload_finished)
+        # M1: START_UV/START_HEPA teslim sonucu → timer YALNIZCA basarili teslimde baslar.
+        self._moonraker_bridge.uv_start_finished.connect(self._on_uv_start_finished)
+        self._moonraker_bridge.hepa_start_finished.connect(self._on_hepa_start_finished)
+        # STOP teslim sonucu → basarida idle, hatada 'STOP failed/STATE?' + banner.
+        self._moonraker_bridge.uv_stop_finished.connect(self._on_uv_stop_finished)
+        self._moonraker_bridge.hepa_stop_finished.connect(self._on_hepa_stop_finished)
         self._alert_banner = None                      # lazy QLabel overlay
         self._banner_timer: Optional[QTimer] = None
 
@@ -1296,27 +1364,229 @@ class KlipperArayuzu(QWidget):
 
         threading.Thread(target=_worker, daemon=True, name="moonraker-post").start()
 
-    # (şimdilik PA8 ve PC5 pinleri bu işlem için atanmıştır. daha sonra değiştirilebilir)
-    def _send_uv_command(self, state: bool) -> None:
-        # START_UV / STOP_UV Klipper makrosu — Moonraker gcode/script üzerinden.
-        # R1: STOP_UV guvenlik-kritik → teslim dogrulanir (lamba fiziksel olarak
-        # ACIK kalmasin). START_UV kozmetik kalir: iletilmezse lamba hic yanmaz,
-        # tehlike olusmaz (sayac calisir ama sterilizasyon olmaz — operator gorur).
-        self._send_moonraker_request(
-            "/printer/gcode/script",
-            {"script": "START_UV" if state else "STOP_UV"},
-            critical=None if state else "STOP_UV",
-        )
+    def _post_moonraker_blocking(self, endpoint: str, payload: Optional[dict] = None,
+                                 timeout: float = 1.5) -> tuple[bool, str]:
+        """BLOCKING, TEK-deneme Moonraker POST → (ok, mesaj). ARKA PLAN thread'inden
+        cagrilmali (GUI'yi bloklamamak icin); Qt widget'larina ASLA dokunmaz. Retry
+        YOK — cagiran karar verir. 'ok' = HTTP 200 (komut Moonraker'a ILETILDI);
+        fiziksel cihazin gercekten actigi/kapandigi AYRICA dogrulanmalidir. STOP'un
+        teslim-dogrulama olcutuyle (HTTP 200) BILEREK ayni tutulmustur (M1)."""
+        if requests is None:
+            return False, "'requests' kutuphanesi kurulu degil."
+        url = f"{self._MOONRAKER_URL}{endpoint}"
+        try:
+            resp = requests.post(url, json=payload, timeout=timeout)
+        except requests.exceptions.RequestException as exc:
+            return False, f"baglanti/timeout: {exc}"
+        except Exception as exc:
+            return False, f"beklenmeyen hata: {exc}"
+        if resp.status_code == 200:
+            return True, "teslim edildi (HTTP 200)"
+        try:
+            detail = str(resp.json().get("error", {}).get("message", ""))
+        except Exception:
+            detail = (resp.text or "")[:120]
+        return False, f"reddedildi (HTTP {resp.status_code}): {detail}"
 
-    # (şimdilik PA8 ve PC5 pinleri bu işlem için atanmıştır. daha sonra değiştirilebilir)
-    def _send_hepa_command(self, state: bool) -> None:
-        # START_HEPA / STOP_HEPA Klipper makrosu.
-        # R1: STOP_HEPA teslimi dogrulanir (fan acik kalmasin); START kozmetik.
-        self._send_moonraker_request(
-            "/printer/gcode/script",
-            {"script": "START_HEPA" if state else "STOP_HEPA"},
-            critical=None if state else "STOP_HEPA",
-        )
+    def _begin_sterilization_start(self, which: str, token: int) -> None:
+        """START_UV/START_HEPA'yi ARKA PLAN thread'inde teslim eder; sonuc bridge
+        sinyaliyle GUI thread'ine doner (queued, token'li). Worker Qt widget'larina
+        ASLA dokunmaz (yalnizca duz bool/int alanlar + network helper). Timer, sonuc
+        slotunda (basarili + GUNCEL teslimde) baslar — burada DEGIL.
+
+        `token` = cagirandaki command_epoch. Worker teslimden SONRA istegin hala
+        GECERLI oldugunu dogrular: kapanmiyoruz + epoch degismemis + kullanici hala
+        ACIK istiyor. Aksi halde sonuc BAYAT'tir → GUI'ye success EMIT EDILMEZ.
+
+        RACE BACKSTOP: START ucustayken kullanici Stop'a basmis (ya da closeEvent STOP
+        gondermis) olabilir. START Klipper'a GEC ulasirsa cikis ACIK kalir. Bu yuzden
+        bayat AMA TESLIM EDILMIS bir START'in ardindan HEMEN telafi STOP'u gonderilir →
+        SON etkili komut her zaman STOP olur.
+
+        BELIRSIZ TESLIM: ok=False, "makro CALISMADI" DEMEK DEGILDIR. Moonraker istegi
+        alip makroyu calistirmis (cikis FIZIKSEL olarak ACILMIS) ama yanit read-timeout
+        / baglanti kopmasi yuzunden bize hic ULASMAMIS olabilir. Bu yuzden HTTP 200
+        ALINAMAYAN her START "cikis ACIK OLABILIR" kabul edilir: confirmed_on
+        konservatif olarak True yazilir ve AYNI telafi STOP yolu isletilir. STOP
+        makrolari idempotent — GEREKSIZ bir STOP, belirsiz sekilde ACIK kalan bir
+        UV/HEPA'dan HER ZAMAN daha guvenlidir. (Tek istisna: `requests` hic yoksa
+        paket hic cikmamistir → belirsizlik yoktur.)"""
+        macro = "START_UV" if which == "uv" else "START_HEPA"
+        stop_macro = "STOP_UV" if which == "uv" else "STOP_HEPA"
+        confirmed_attr = ("_uv_output_confirmed_on" if which == "uv"
+                          else "_hepa_output_confirmed_on")
+        inflight_attr = "_uv_start_inflight" if which == "uv" else "_hepa_start_inflight"
+        epoch_attr = "_uv_command_epoch" if which == "uv" else "_hepa_command_epoch"
+        desired_attr = "_uv_desired_on" if which == "uv" else "_hepa_desired_on"
+        bridge = self._moonraker_bridge
+        sig = (bridge.uv_start_finished if which == "uv"
+               else bridge.hepa_start_finished)
+        stop_sig = (bridge.uv_stop_finished if which == "uv"
+                    else bridge.hepa_stop_finished)
+
+        def _emit(signal, tok, okv, message) -> None:
+            # Emit hatasini ASLA sessizce yutma (imza uyumsuzlugu bir kez tam da boyle
+            # gizlenmisti); kapanista koprunun C++ tarafi silinmis olabilir → logla.
+            try:
+                signal.emit(int(tok), bool(okv), str(message))
+            except Exception as exc:
+                print(f"[STERILIZATION] {macro} sonuc sinyali emit edilemedi: {exc}")
+
+        def _worker() -> None:
+            ok, msg = self._post_moonraker_blocking(
+                "/printer/gcode/script", {"script": macro})
+            # START worker'i GERCEKTEN bitti. inflight bayragini YALNIZCA burasi
+            # temizler: Stop butonu erken temizlerse kapanis-STOP kapsami yanlis
+            # daralir ve hala ucusta olan bir START gorunmez hale gelir.
+            setattr(self, inflight_attr, False)
+
+            stale = (self._closing
+                     or int(getattr(self, epoch_attr)) != int(token)
+                     or not bool(getattr(self, desired_attr)))
+
+            if ok:
+                setattr(self, confirmed_attr, True)   # son dogrulanan teslim: ON
+                if not stale:
+                    _emit(sig, token, True, msg)      # normal yol → timer GUI'de baslar
+                    return
+            elif requests is None:
+                # Hicbir paket cikmadi → cikis KESINLIKLE acilmadi. Belirsizlik yok,
+                # telafi STOP'u anlamsiz olur.
+                if not stale:
+                    _emit(sig, token, False, msg)
+                return
+            else:
+                # BELIRSIZ: yanit alinamadi AMA makro sunucuda calismis olabilir
+                # (read timeout / baglanti kopmasi). Konservatif ol: cikis ACIK varsay.
+                setattr(self, confirmed_attr, True)
+
+            # Buraya dusen HER durumda cikis ACIK OLABILIR ve bu START artik gecerli
+            # degil (BAYAT ya da BELIRSIZ) → niyeti dusur + bounded telafi STOP gonder.
+            # Boylece SON etkili komut her zaman STOP olur.
+            setattr(self, desired_attr, False)
+            sok, smsg = self._deliver_stop_on_close(stop_macro)
+            if sok:
+                setattr(self, confirmed_attr, False)  # son dogrulanan teslim: OFF
+            print(f"[STERILIZATION] {macro} sonucu "
+                  f"{'BAYAT' if stale else 'BELIRSIZ'} (ok={ok}) -> {stop_macro} "
+                  f"telafisi ok={sok} ({smsg}). FIZIKSEL kapanma DOGRULANMADI.")
+            if self._closing:
+                return
+
+            if not sok:
+                # Telafi de teslim EDILEMEDI → cikis ACIK olabilir. Satiri temiz "Start"
+                # gostermeye BIRAKMA: GUNCEL epoch ile STOP-basarisiz sonucu uret →
+                # "STOP failed / STATE?" + banner + Stop ile retry.
+                _emit(stop_sig, int(getattr(self, epoch_attr)), False,
+                      f"{macro} sonucu belirsiz/bayat, {stop_macro} telafisi "
+                      f"basarisiz: {smsg}")
+                return
+
+            if not stale:
+                # Telafi STOP TESLIM EDILDI → cikis kapali. Kullanici hala bu satirin
+                # sahibi ve "Starting..." goruyor: START basarisiz + guvenlik icin STOP
+                # uygulandi sonucunu bildir → guvenli idle + banner.
+                _emit(sig, token, False,
+                      f"{msg} — guvenlik icin {stop_macro} uygulandi")
+            # BAYAT ise UI'yi zaten kullanicinin kendi Stop'u / closeEvent surdu.
+
+        threading.Thread(target=_worker, daemon=True, name=f"{which}-start").start()
+
+    def _begin_sterilization_stop(self, which: str, token: int) -> None:
+        """STOP_UV/STOP_HEPA'yi ARKA PLAN thread'inde teslim eder; sonuc bridge
+        sinyaliyle GUI'ye doner (queued, token'li). HTTP 200 → confirmed-delivery
+        durumu OFF (fiziksel kapanma DEGIL). Worker Qt'ye dokunmaz.
+
+        stop_inflight bayragini worker TEMIZLEMEZ: bunu sonuc handler'i YALNIZCA
+        token guncelse yapar — boylece bayat bir worker, daha yeni bir istegin
+        guard'ini dusuremez."""
+        macro = "STOP_UV" if which == "uv" else "STOP_HEPA"
+        confirmed_attr = ("_uv_output_confirmed_on" if which == "uv"
+                          else "_hepa_output_confirmed_on")
+        bridge = self._moonraker_bridge
+        sig = (bridge.uv_stop_finished if which == "uv"
+               else bridge.hepa_stop_finished)
+
+        def _worker() -> None:
+            ok, msg = self._post_moonraker_blocking(
+                "/printer/gcode/script", {"script": macro})
+            if ok:
+                setattr(self, confirmed_attr, False)   # son dogrulanan teslim: OFF
+            try:
+                sig.emit(int(token), bool(ok), msg)
+            except Exception as exc:
+                print(f"[STERILIZATION] {macro} sonuc sinyali emit edilemedi: {exc}")
+
+        threading.Thread(target=_worker, daemon=True, name=f"{which}-stop").start()
+
+    def _deliver_stop_on_close(self, macro: str, timeout: float = 1.0) -> tuple[bool, str]:
+        """SENKRON, TEK-deneme, kisa-timeout'lu STOP POST'u — "son care" telafi yolu.
+        Daemon thread KULLANMAZ (kapanista daemon oldurulur → teslim garantisiz kalirdi)
+        ve normal runtime network akisini (retry + bridge) DEGISTIRMEZ. Iki yerde kullanilir:
+        (1) closeEvent'in bounded STOP'u, (2) bayat-ama-teslim-edilmis bir START'in
+        ardindan gonderilen telafi STOP'u (zaten arka plan worker'inda kosar). Cagirani
+        en fazla ~`timeout` sn bloke eder. Donus (ok, mesaj); ok = HTTP 200 = TESLIM
+        (fiziksel kapanma DEGIL)."""
+        if requests is None:
+            return False, "'requests' kutuphanesi yok"
+        try:
+            resp = requests.post(f"{self._MOONRAKER_URL}/printer/gcode/script",
+                                 json={"script": macro}, timeout=timeout)
+        except Exception as exc:
+            return False, f"iletilemedi: {exc}"
+        if resp.status_code == 200:
+            return True, "teslim edildi (HTTP 200)"
+        return False, f"reddedildi (HTTP {resp.status_code})"
+
+    def _safe_stop_sterilization_on_close(self) -> None:
+        """closeEvent (C1/H1): aktif ya da START-ucustaki UV/HEPA icin timer'i durdur
+        ve STOP'u KISA/BOUNDED (cihaz basina tek deneme ~1 sn) teslim etmeye calis.
+        Teslim edilemezse closeEvent KILITLENMEZ; diagnostic log yazilir. Bu YALNIZCA
+        STOP TESLIMIDIR — fiziksel cikisin kapandigi GARANTI EDILMEZ (gercek-cihaz
+        dogrulamasi ayrica gereklidir). Toplam en fazla ~2 sn (UV + HEPA).
+
+        Aktiflik yalnizca timer'a bagli DEGIL: cikis ACIK olabilecek HER durum sayilir —
+        timer kosuyor, START hala ucusta, STOP ucusta (daemon thread kapanista oldurulur →
+        teslimi garanti DEGIL) ya da son dogrulanan teslim ON. start_inflight/stop_inflight
+        BURADA temizlenmez: worker'lar gercekten ucusta olabilir, state yalanlanmamali."""
+        # --- UV ---
+        uv_active = ((self.uv_timer is not None and self.uv_timer.isActive())
+                     or self._uv_start_inflight
+                     or self._uv_stop_inflight
+                     or self._uv_output_confirmed_on)
+        if self.uv_timer is not None:
+            try:
+                self.uv_timer.stop()
+            except Exception:
+                pass
+        if uv_active:
+            ok, msg = self._deliver_stop_on_close("STOP_UV")
+            if ok:
+                self._uv_output_confirmed_on = False
+            print(f"[CLOSE] STOP_UV teslim denemesi: ok={ok} ({msg}). "
+                  "FIZIKSEL kapanma DOGRULANMADI.")
+        # --- HEPA ---
+        hepa_active = ((self.hepa_timer is not None and self.hepa_timer.isActive())
+                       or self._hepa_start_inflight
+                       or self._hepa_stop_inflight
+                       or self._hepa_output_confirmed_on)
+        if self.hepa_timer is not None:
+            try:
+                self.hepa_timer.stop()
+            except Exception:
+                pass
+        if hepa_active:
+            ok, msg = self._deliver_stop_on_close("STOP_HEPA")
+            if ok:
+                self._hepa_output_confirmed_on = False
+            print(f"[CLOSE] STOP_HEPA teslim denemesi: ok={ok} ({msg}). "
+                  "FIZIKSEL kapanma DOGRULANMADI.")
+
+    # NOT: eski _send_uv_command / _send_hepa_command KALDIRILDI. START artik
+    # _begin_sterilization_start (teslim-dogrulamali), STOP artik
+    # _begin_sterilization_stop (teslim-sonuclu) uzerinden gider. Boylece START/STOP
+    # icin TEK gonderim yolu vardir — gizli ikinci transport (double-start riski) yok.
+    # (PA8 = uv_led, PC5 = hepa_fan pinleri; START_UV/STOP_UV/START_HEPA/STOP_HEPA makrolari.)
 
     def _on_ph_temp_changed(self, value: float) -> None:
         """Printhead Temperature spinbox → AKTIF peltier'e canli sicaklik hedefi.
@@ -1359,27 +1629,65 @@ class KlipperArayuzu(QWidget):
     def _start_uv(self) -> None:
         if not self.uv_zaman_kutusu or not self.uv_start_btn or not self.uv_kalan_sure_lbl:
             return
-
+        if self._closing:
+            return
+        # M1: zaten calisiyor, START ucusta ya da STOP ucustaysa yeni START YOK
+        # (cift-tik korumasi + tek teslim; ucustaki bir STOP'un ustune START binmesin).
+        # Timer BURADA baslamaz — yalnizca START_UV Moonraker'a TESLIM edildigi
+        # DOGRULANINCA (_on_uv_start_finished) baslar; teslim edilemezse UI 'Running'
+        # GOSTERMEZ (kullanici yanlis "calisiyor" sanmaz).
+        if (self._uv_start_inflight or self._uv_stop_inflight
+                or (self.uv_timer is not None and self.uv_timer.isActive())):
+            return
         if self.uv_timer is None:
             self.uv_timer = QTimer(self)
             self.uv_timer.timeout.connect(self._uv_tick)
-
-        self.uv_kalan_saniye = self.uv_zaman_kutusu.value() * 60
+        self._uv_desired_on = True
+        self._uv_command_epoch += 1
+        token = self._uv_command_epoch
+        self._uv_pending_seconds = self.uv_zaman_kutusu.value() * 60
+        self._uv_start_inflight = True
         self.uv_start_btn.setEnabled(False)
         self.uv_zaman_kutusu.setEnabled(False)
+        self.uv_start_btn.setText("Starting...")
+        self.uv_start_btn.setStyleSheet(
+            "font-size:18px; padding:10px 30px; background:#FFE0B2; color:black;"
+        )
+        self.uv_kalan_sure_lbl.setText("--:--")
+        self._begin_sterilization_start("uv", token)
+
+    def _on_uv_start_finished(self, token: int, ok: bool, msg: str) -> None:
+        """START_UV teslim sonucu (GUI thread, queued sinyal). Timer YALNIZCA teslim
+        DOGRULANINCA baslar; teslim edilemezse UI pasife doner + hata banner'i. 'ok'
+        komutun Moonraker'a ILETILDIGINI gosterir; lambanin fiziksel olarak yandigini
+        DEGIL (fiziksel dogrulama ayri gereklidir)."""
+        if token != self._uv_command_epoch:
+            return   # BAYAT: kullanici bu arada Stop'a basti / yeni istek geldi.
+                     # Telafi STOP'u worker tarafinda gonderildi; state'e DOKUNMA.
+        if self._closing:
+            return
+        # _uv_start_inflight'i worker temizler (tek sahip) — burada dokunulmaz.
+        if not ok:
+            # NOT: "teslim edilemedi" DEMIYORUZ — teslim BELIRSIZ olabilirdi. Bu noktaya
+            # ancak telafi STOP'u TESLIM EDILDIYSE gelinir (cikis kapali) → guvenli idle.
+            self._uv_desired_on = False
+            self._uv_reset_idle_ui()
+            self._show_banner(f"UV baslatilamadi: {msg}", kind="error")
+            return
+        if self.uv_timer is None:                 # savunma; normalde _start_uv kurar
+            self.uv_timer = QTimer(self)
+            self.uv_timer.timeout.connect(self._uv_tick)
+        self.uv_kalan_saniye = self._uv_pending_seconds
         self.uv_start_btn.setText("Running...")
         self.uv_start_btn.setStyleSheet(
             "font-size:18px; padding:10px 30px; background:#81C784; color:black;"
         )
-
         mins, secs = divmod(self.uv_kalan_saniye, 60)
         self.uv_kalan_sure_lbl.setText(f"{mins:02d}:{secs:02d}")
-        self._send_uv_command(True)
         self.uv_timer.start(1000)
 
-    def _stop_uv(self) -> None:
-        if self.uv_timer and self.uv_timer.isActive():
-            self.uv_timer.stop()
+    def _uv_reset_idle_ui(self) -> None:
+        """UV satirini pasif/idle gorunume dondurur (buton 'Start', label '--:--')."""
         if self.uv_start_btn and self.uv_zaman_kutusu and self.uv_kalan_sure_lbl:
             self.uv_start_btn.setEnabled(True)
             self.uv_zaman_kutusu.setEnabled(True)
@@ -1388,7 +1696,69 @@ class KlipperArayuzu(QWidget):
                 "font-size:18px; padding:10px 30px; background:#e0e0e0; color:black;"
             )
             self.uv_kalan_sure_lbl.setText("--:--")
-        self._send_uv_command(False)
+
+    def _stop_uv(self) -> None:
+        # Timer'i hemen durdur ama STOP teslimi DOGRULANANA kadar tam "Start/idle"
+        # GOSTERME: gecis "Stopping..." + Start disable. Sonuc _on_uv_stop_finished'a
+        # doner (200 → idle + confirmed OFF; hata → 'STOP failed/STATE?' + banner).
+        # Stop butonu acik kalir → basarisizlikta tekrar denenebilir.
+        #
+        # Niyet HER cagrida (guard'dan ONCE) yazilir: ucustaki bir START worker'i
+        # teslimden sonra bunu okuyup telafi STOP'u gonderebilsin.
+        self._uv_desired_on = False
+        # Ayni cihaz icin ZATEN bir STOP ucustaysa IKINCI worker uretme: cift-tik ya da
+        # "timer timeout + kullanici Stop ayni turda" tek STOP'a indirgenir. Guard yalnizca
+        # GUNCEL istegi kapsar; sonuc dondugunde temizlenir → basarisiz STOP retry edilebilir.
+        if self._uv_stop_inflight:
+            return
+        self._uv_command_epoch += 1
+        token = self._uv_command_epoch
+        self._uv_stop_inflight = True
+        # NOT: _uv_start_inflight BURADA temizlenmez — START worker'i hala GERCEKTEN
+        # ucusta olabilir. Erken temizlemek kapanis-STOP kapsamini yanlis daraltirdi.
+        if self.uv_timer and self.uv_timer.isActive():
+            self.uv_timer.stop()
+        if self.uv_start_btn and self.uv_kalan_sure_lbl:
+            self.uv_start_btn.setEnabled(False)
+            self.uv_start_btn.setText("Stopping...")
+            self.uv_start_btn.setStyleSheet(
+                "font-size:18px; padding:10px 30px; background:#FFE0B2; color:black;")
+            if self.uv_zaman_kutusu:
+                self.uv_zaman_kutusu.setEnabled(False)
+            self.uv_kalan_sure_lbl.setText("--:--")
+        self._begin_sterilization_stop("uv", token)
+
+    def _on_uv_stop_finished(self, token: int, ok: bool, msg: str) -> None:
+        """STOP_UV teslim sonucu (GUI thread). 200 → cikis OFF (dogrulanan teslim) +
+        idle UI. Teslim edilemezse UI tam 'Start'a DONMEZ: 'STOP failed / STATE?' +
+        Start disable (cikis ACIK olabilir) + hata banner; Stop'a tekrar basilarak
+        retry edilir. 'confirmed' fiziksel sensor DEGIL, son dogrulanan teslimdir."""
+        if token != self._uv_command_epoch:
+            return   # BAYAT: daha yeni bir istek var → onun state'ini EZME.
+        self._uv_stop_inflight = False   # guncel istek bitti → retry serbest
+        self._uv_desired_on = False
+        if ok:
+            # STOP TESLIM EDILDI (HTTP 200) → son dogrulanan teslim OFF. Fiziksel
+            # kapanma DEGIL; yalnizca "en son iletilen komut STOP idi".
+            self._uv_output_confirmed_on = False
+        # Basarisizlikta _uv_output_confirmed_on BILEREK degistirilmez: cikis ACIK
+        # kalmis olabilir → True/unknown korunur (kapanis-STOP kapsami bunu okur).
+        if self._closing:
+            return
+        if ok:
+            self._uv_reset_idle_ui()
+            return
+        if self.uv_start_btn and self.uv_kalan_sure_lbl:
+            if self.uv_zaman_kutusu:
+                self.uv_zaman_kutusu.setEnabled(True)
+            self.uv_start_btn.setEnabled(False)   # cikis ACIK olabilir → yeni START yok
+            self.uv_start_btn.setText("STOP failed")
+            self.uv_start_btn.setStyleSheet(
+                "font-size:18px; padding:10px 30px; background:#E57373; color:black;")
+            self.uv_kalan_sure_lbl.setText("STATE?")
+        self._show_banner(
+            f"UV STOP teslim edilemedi — cikis ACIK olabilir. Stop'a tekrar bas: {msg}",
+            kind="error")
 
     def _uv_tick(self) -> None:
         self.uv_kalan_saniye -= 1
@@ -1404,27 +1774,60 @@ class KlipperArayuzu(QWidget):
     def _start_hepa(self) -> None:
         if not self.hepa_zaman_kutusu or not self.hepa_start_btn or not self.hepa_kalan_sure_lbl:
             return
-
+        if self._closing:
+            return
+        # M1: HEPA icin de teslim-dogrulamali START (UV ile ayni mantik). Timer
+        # yalnizca START_HEPA teslimi DOGRULANINCA (_on_hepa_start_finished) baslar.
+        if (self._hepa_start_inflight or self._hepa_stop_inflight
+                or (self.hepa_timer is not None and self.hepa_timer.isActive())):
+            return
         if self.hepa_timer is None:
             self.hepa_timer = QTimer(self)
             self.hepa_timer.timeout.connect(self._hepa_tick)
-
-        self.hepa_kalan_saniye = self.hepa_zaman_kutusu.value() * 60
+        self._hepa_desired_on = True
+        self._hepa_command_epoch += 1
+        token = self._hepa_command_epoch
+        self._hepa_pending_seconds = self.hepa_zaman_kutusu.value() * 60
+        self._hepa_start_inflight = True
         self.hepa_start_btn.setEnabled(False)
         self.hepa_zaman_kutusu.setEnabled(False)
+        self.hepa_start_btn.setText("Starting...")
+        self.hepa_start_btn.setStyleSheet(
+            "font-size:18px; padding:10px 30px; background:#FFE0B2; color:black;"
+        )
+        self.hepa_kalan_sure_lbl.setText("--:--")
+        self._begin_sterilization_start("hepa", token)
+
+    def _on_hepa_start_finished(self, token: int, ok: bool, msg: str) -> None:
+        """START_HEPA teslim sonucu (GUI thread). Timer YALNIZCA teslim DOGRULANINCA
+        baslar; aksi halde UI pasife doner + hata banner'i. 'ok' teslimi gosterir,
+        fanin fiziksel olarak dondugunu DEGIL."""
+        if token != self._hepa_command_epoch:
+            return   # BAYAT: telafi STOP'u worker'da gonderildi; state'e DOKUNMA.
+        if self._closing:
+            return
+        # _hepa_start_inflight'i worker temizler (tek sahip) — burada dokunulmaz.
+        if not ok:
+            # Bkz. _on_uv_start_finished: buraya yalnizca telafi STOP'u teslim edildiginde
+            # gelinir → cikis kapali, guvenli idle.
+            self._hepa_desired_on = False
+            self._hepa_reset_idle_ui()
+            self._show_banner(f"HEPA baslatilamadi: {msg}", kind="error")
+            return
+        if self.hepa_timer is None:
+            self.hepa_timer = QTimer(self)
+            self.hepa_timer.timeout.connect(self._hepa_tick)
+        self.hepa_kalan_saniye = self._hepa_pending_seconds
         self.hepa_start_btn.setText("Running...")
         self.hepa_start_btn.setStyleSheet(
             "font-size:18px; padding:10px 30px; background:#81C784; color:black;"
         )
-
         mins, secs = divmod(self.hepa_kalan_saniye, 60)
         self.hepa_kalan_sure_lbl.setText(f"{mins:02d}:{secs:02d}")
-        self._send_hepa_command(True)
         self.hepa_timer.start(1000)
 
-    def _stop_hepa(self) -> None:
-        if self.hepa_timer and self.hepa_timer.isActive():
-            self.hepa_timer.stop()
+    def _hepa_reset_idle_ui(self) -> None:
+        """HEPA satirini pasif/idle gorunume dondurur."""
         if self.hepa_start_btn and self.hepa_zaman_kutusu and self.hepa_kalan_sure_lbl:
             self.hepa_start_btn.setEnabled(True)
             self.hepa_zaman_kutusu.setEnabled(True)
@@ -1433,7 +1836,55 @@ class KlipperArayuzu(QWidget):
                 "font-size:18px; padding:10px 30px; background:#e0e0e0; color:black;"
             )
             self.hepa_kalan_sure_lbl.setText("--:--")
-        self._send_hepa_command(False)
+
+    def _stop_hepa(self) -> None:
+        # UV _stop_uv ile ayni: gecis "Stopping..." + Start disable; STOP teslimi
+        # DOGRULANANA kadar tam idle GOSTERME. Sonuc _on_hepa_stop_finished'a doner.
+        self._hepa_desired_on = False   # niyet guard'dan ONCE yazilir (bkz. _stop_uv)
+        if self._hepa_stop_inflight:
+            return                      # ucusta STOP var → ikinci worker YOK
+        self._hepa_command_epoch += 1
+        token = self._hepa_command_epoch
+        self._hepa_stop_inflight = True
+        # NOT: _hepa_start_inflight BURADA temizlenmez (bkz. _stop_uv).
+        if self.hepa_timer and self.hepa_timer.isActive():
+            self.hepa_timer.stop()
+        if self.hepa_start_btn and self.hepa_kalan_sure_lbl:
+            self.hepa_start_btn.setEnabled(False)
+            self.hepa_start_btn.setText("Stopping...")
+            self.hepa_start_btn.setStyleSheet(
+                "font-size:18px; padding:10px 30px; background:#FFE0B2; color:black;")
+            if self.hepa_zaman_kutusu:
+                self.hepa_zaman_kutusu.setEnabled(False)
+            self.hepa_kalan_sure_lbl.setText("--:--")
+        self._begin_sterilization_stop("hepa", token)
+
+    def _on_hepa_stop_finished(self, token: int, ok: bool, msg: str) -> None:
+        """STOP_HEPA teslim sonucu (GUI thread). 200 → OFF + idle; hata → UI tam
+        idle'a DONMEZ ('STOP failed/STATE?') + Start disable + banner; Stop ile retry."""
+        if token != self._hepa_command_epoch:
+            return   # BAYAT: daha yeni istek var → state'ini EZME.
+        self._hepa_stop_inflight = False   # guncel istek bitti → retry serbest
+        self._hepa_desired_on = False
+        if ok:
+            self._hepa_output_confirmed_on = False   # son dogrulanan teslim: OFF
+        # Basarisizlikta confirmed BILEREK korunur (cikis ACIK olabilir) — bkz. _on_uv_stop_finished.
+        if self._closing:
+            return
+        if ok:
+            self._hepa_reset_idle_ui()
+            return
+        if self.hepa_start_btn and self.hepa_kalan_sure_lbl:
+            if self.hepa_zaman_kutusu:
+                self.hepa_zaman_kutusu.setEnabled(True)
+            self.hepa_start_btn.setEnabled(False)
+            self.hepa_start_btn.setText("STOP failed")
+            self.hepa_start_btn.setStyleSheet(
+                "font-size:18px; padding:10px 30px; background:#E57373; color:black;")
+            self.hepa_kalan_sure_lbl.setText("STATE?")
+        self._show_banner(
+            f"HEPA STOP teslim edilemedi — cikis ACIK olabilir. Stop'a tekrar bas: {msg}",
+            kind="error")
 
     def _hepa_tick(self) -> None:
         self.hepa_kalan_saniye -= 1

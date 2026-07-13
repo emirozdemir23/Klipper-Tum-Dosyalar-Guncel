@@ -292,6 +292,10 @@ gcode:
     # UV must never remain energized after an idle timeout.
     STOP_UV
 
+    # HEPA fan must not remain energized after an idle timeout either.
+    # idle_timeout is the only firmware-level backstop for it (H1).
+    STOP_HEPA
+
     # Keep the existing default stepper-disable behavior.
     M84
 
