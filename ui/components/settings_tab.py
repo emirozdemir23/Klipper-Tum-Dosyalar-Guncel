@@ -1,245 +1,265 @@
-"""Settings tab: printhead selection, print parameters, temperatures, and the
-Save / Slice action buttons (view only).
-
-The build-platform info label (``bp_info_lbl``) is populated by the controller;
-Save / Slice behavior is wired by the controller. The right-hand region is an
-intentional transparent placeholder — the layer preview lives in PreviewTab.
-"""
+"""Compact Settings view with three independent printhead profile tabs."""
 from __future__ import annotations
 
-from PyQt6.QtWidgets import (
-    QWidget, QVBoxLayout, QHBoxLayout, QFormLayout, QPushButton, QButtonGroup,
-    QLabel, QFrame, QComboBox, QDoubleSpinBox, QProgressBar,
-)
 from PyQt6.QtCore import Qt
-
-from ui.styles import (
-    PH_BTN_STYLE, COMBOBOX_STYLE, CARD_STYLE, LABEL_STYLE, SPINBOX_STYLE,
+from PyQt6.QtWidgets import (
+    QComboBox,
+    QDoubleSpinBox,
+    QFormLayout,
+    QFrame,
+    QGridLayout,
+    QHBoxLayout,
+    QLabel,
+    QProgressBar,
+    QPushButton,
+    QTabWidget,
+    QVBoxLayout,
+    QWidget,
 )
+
+from core.printhead import (
+    NOZZLE_DIAMETER_DEFAULT,
+    NOZZLE_DIAMETER_MAX,
+    NOZZLE_DIAMETER_MIN,
+    PRINTHEAD_IDS,
+    PRINTHEAD_TEMPERATURE_DEFAULT,
+    PRINTHEAD_TEMPERATURE_MAX,
+    PRINTHEAD_TEMPERATURE_MIN,
+    PRINT_SPEED_DEFAULT,
+    PRINT_SPEED_MAX,
+    PRINT_SPEED_MIN,
+    normalize_printhead_profiles,
+    normalize_selected_printhead,
+)
+from ui.styles import CARD_STYLE, COMBOBOX_STYLE, LABEL_STYLE, SPINBOX_STYLE
 
 
 class SettingsTab(QWidget):
     def __init__(self, parent: QWidget | None = None) -> None:
         super().__init__(parent)
-        layout = QVBoxLayout(self)
-        self._build(layout)
+        root = QVBoxLayout(self)
+        root.setContentsMargins(5, 4, 5, 4)
+        root.setSpacing(4)
+        self._build(root)
 
     def _build(self, layout: QVBoxLayout) -> None:
-        main = QHBoxLayout()
-        main.setSpacing(20)
-
-        # ==================== SOL PANEL ====================
-        sol = QVBoxLayout()
-        sol.setSpacing(12)
-
-        # --- Printhead Seçimi ---
-        title = QLabel("Printheads")
-        title.setStyleSheet("font-size:22px; font-weight:bold; color:#333333;")
-        sol.addWidget(title)
-
-        ph_row = QHBoxLayout()
-        ph_row.setSpacing(10)
-        self.ph1_btn = QPushButton("Printhead 1")
-        self.ph2_btn = QPushButton("Printhead 2")
-        self.ph3_btn = QPushButton("Printhead 3")
-        self.ph_buton_grubu = QButtonGroup(self)
-        self.ph_buton_grubu.setExclusive(True)
-
-        for i, btn in enumerate((self.ph1_btn, self.ph2_btn, self.ph3_btn), 1):
-            btn.setStyleSheet(PH_BTN_STYLE)
-            btn.setCheckable(True)
-            btn.setFixedHeight(45)
-            self.ph_buton_grubu.addButton(btn, i)
-            ph_row.addWidget(btn)
-
-        self.ph1_btn.setChecked(True)
-        ph_row.addStretch()
-        sol.addLayout(ph_row)
-
-        # --- Printhead Type (ComboBox) ---
         type_row = QHBoxLayout()
-        type_row.setSpacing(15)
-
-        type_lbl = QLabel("Printhead Type")
-        type_lbl.setStyleSheet("font-size:16px; color:#555555;")
-        type_lbl.setFixedWidth(190)
-        type_row.addWidget(type_lbl)
-
+        type_row.setSpacing(8)
+        type_label = QLabel("Printhead Type")
+        type_label.setStyleSheet("font-size:14px; color:#555555; font-weight:bold;")
         self.ph_type_combo = QComboBox()
         self.ph_type_combo.addItem("Temperature Control")
-        self.ph_type_combo.setFixedWidth(180)
+        self.ph_type_combo.setFixedWidth(175)
+        self.ph_type_combo.setFixedHeight(28)
         self.ph_type_combo.setStyleSheet(COMBOBOX_STYLE)
+        type_row.addWidget(type_label)
         type_row.addWidget(self.ph_type_combo)
         type_row.addStretch()
-        sol.addLayout(type_row)
+        layout.addLayout(type_row)
 
-        # --- Print Parameters Kartı ---
-        g1 = QFrame()
-        g1.setObjectName("KareMekan")
-        g1.setStyleSheet(CARD_STYLE)
-        f1 = QFormLayout(g1)
-        f1.setVerticalSpacing(10)
-        f1.setHorizontalSpacing(15)
-        f1.setContentsMargins(15, 12, 15, 12)
+        self.printhead_tabs = QTabWidget()
+        self.printhead_tabs.setObjectName("printhead_tabs")
+        self.printhead_tabs.setFixedHeight(146)
+        self.printhead_tabs.setStyleSheet("""
+            QTabWidget::pane { border:1px solid #D6E2EA; border-radius:5px; background:#FFFFFF; }
+            QTabBar::tab {
+                min-width:112px; min-height:27px; padding:2px 10px;
+                font-size:14px; font-weight:bold; color:#333333;
+                background:#EAF3FA; border:1px solid #C5D9E8;
+            }
+            QTabBar::tab:selected { background:#64B5F6; color:#102A43; }
+        """)
+        self.printhead_widgets: dict[int, dict[str, QDoubleSpinBox]] = {}
+        self.nozzle_diameter_spins: dict[int, QDoubleSpinBox] = {}
+        self.print_speed_spins: dict[int, QDoubleSpinBox] = {}
+        self.printhead_temperature_spins: dict[int, QDoubleSpinBox] = {}
 
-        self.kutu_layer = self._create_spinbox(f1, "Layer Thickness", 0.05, 2.0, 2, 0.01, " mm", 0.2)
-        # Ust sinir 30 mm/s: klipper.txt [printer] max_velocity: 30 (4mm/tur Z
-        # vidali mil gercegi). 60'a izin vermek yaniltici olurdu — Klipper zaten
-        # 30'da kirpar; dosyadaki F degeri makinenin yapabildigiyle eslessin.
-        self.kutu_speed = self._create_spinbox(f1, "Print Speed", 1, 30, 0, 1, " mm/s", 10)
+        for head in PRINTHEAD_IDS:
+            page = QWidget()
+            form = QFormLayout(page)
+            form.setContentsMargins(12, 7, 12, 7)
+            form.setVerticalSpacing(4)
+            form.setHorizontalSpacing(12)
+            nozzle = self._create_spinbox(
+                form, "Nozzle Diameter",
+                NOZZLE_DIAMETER_MIN, NOZZLE_DIAMETER_MAX, 2, 0.01, " mm",
+                NOZZLE_DIAMETER_DEFAULT,
+            )
+            nozzle.setKeyboardTracking(True)
+            speed = self._create_spinbox(
+                form, "Print Speed",
+                PRINT_SPEED_MIN, PRINT_SPEED_MAX, 0, 1, " mm/s",
+                PRINT_SPEED_DEFAULT,
+            )
+            temperature = self._create_spinbox(
+                form, "Printhead Temperature",
+                PRINTHEAD_TEMPERATURE_MIN, PRINTHEAD_TEMPERATURE_MAX,
+                0, 1, " °C", PRINTHEAD_TEMPERATURE_DEFAULT,
+            )
+            temperature.setKeyboardTracking(False)
+            widgets = {
+                "nozzle_diameter_mm": nozzle,
+                "print_speed_mm_s": speed,
+                "temperature_c": temperature,
+            }
+            self.printhead_widgets[head] = widgets
+            self.nozzle_diameter_spins[head] = nozzle
+            self.print_speed_spins[head] = speed
+            self.printhead_temperature_spins[head] = temperature
+            setattr(self, f"ph{head}_nozzle_diameter_spin", nozzle)
+            setattr(self, f"ph{head}_print_speed_spin", speed)
+            setattr(self, f"ph{head}_temperature_spin", temperature)
+            self.printhead_tabs.addTab(page, f"Printhead {head}")
+        layout.addWidget(self.printhead_tabs)
 
-        lbl_grid = QLabel("Grid Type")
-        lbl_grid.setStyleSheet(LABEL_STYLE)
-        lbl_grid.setFixedWidth(190)
+        globals_frame = QFrame()
+        globals_frame.setObjectName("KareMekan")
+        globals_frame.setStyleSheet(CARD_STYLE)
+        globals_grid = QGridLayout(globals_frame)
+        globals_grid.setContentsMargins(10, 6, 10, 6)
+        globals_grid.setHorizontalSpacing(10)
+        globals_grid.setVerticalSpacing(4)
+
+        self.kutu_layer = self._create_grid_spinbox(
+            globals_grid, 0, 0, "Layer Thickness", 0.05, 2.0, 2, 0.01, " mm", 0.2)
         self.kutu_grid = QComboBox()
-        # Tek gercek infill deseni var (slicer_worker.build_infill_grid_2d = capraz
-        # tarama izgarasi). Baska desen fonksiyonu YOK; yaniltici secenek isimleri
-        # kaldirildi, desteklenen TEK deger "Linear".
-        self.kutu_grid.addItems(["Linear"])
+        self.kutu_grid.addItem("Linear")
         self.kutu_grid.setCurrentText("Linear")
-        self.kutu_grid.setFixedWidth(120)
+        self.kutu_grid.setFixedWidth(105)
+        self.kutu_grid.setFixedHeight(27)
         self.kutu_grid.setStyleSheet(COMBOBOX_STYLE)
-        f1.addRow(lbl_grid, self.kutu_grid)
-
-        self.kutu_distance = self._create_spinbox(f1, "Grid Distance", 0.01, 5.0, 2, 0.01, " mm", 0.2)
-        sol.addWidget(g1)
-
-        # --- Temperature Kartı ---
-        g2 = QFrame()
-        g2.setObjectName("KareMekan")
-        g2.setStyleSheet(CARD_STYLE)
-        f2 = QFormLayout(g2)
-        f2.setVerticalSpacing(10)
-        f2.setHorizontalSpacing(15)
-        f2.setContentsMargins(15, 12, 15, 12)
-
-        self.kutu_ph_temp = self._create_spinbox(f2, "Printhead Temperature", 4, 45, 0, 1, " °C", 27.0)
-        self.kutu_plat_temp = self._create_spinbox(f2, "Platform Temperature", -30.0, 40, 0, 1, " °C", -30.0)
-        # R7: Bu iki kutu HER valueChanged'de canli SET_HEATER_TEMPERATURE /
-        # SET_TEMPERATURE_FAN_TARGET gonderir (main_window baglar). Varsayilan
-        # keyboardTracking=True ile "37" yazarken once TARGET=3.0 giderdi —
-        # canli peltier'e GECICI YANLIS hedef. False: deger yalnizca Enter /
-        # odak kaybi / ok tuslarinda commit edilir (tus basina POST da biter).
-        self.kutu_ph_temp.setKeyboardTracking(False)
+        self._add_grid_field(globals_grid, 0, 1, "Grid Type", self.kutu_grid)
+        self.kutu_distance = self._create_grid_spinbox(
+            globals_grid, 1, 0, "Grid Distance", 0.01, 5.0, 2, 0.01, " mm", 0.2)
+        self.kutu_plat_temp = self._create_grid_spinbox(
+            globals_grid, 1, 1, "Platform Temperature", -30.0, 40, 0, 1, " °C", -30.0)
         self.kutu_plat_temp.setKeyboardTracking(False)
-        sol.addWidget(g2)
+        layout.addWidget(globals_frame)
 
-        # --- Build Platform Info (Kompakt) ---
-        g3 = QFrame()
-        g3.setStyleSheet("""
-            QFrame {
-                background:#FFFFFF; border:1px solid #E0E0E0; border-radius:6px;
-            }
-        """)
-        f3 = QHBoxLayout(g3)
-        f3.setContentsMargins(12, 8, 12, 8)
-
-        bp_title = QLabel("Build Platform:")
-        bp_title.setStyleSheet("font-size:14px; color:#555; font-weight:bold;")
-        f3.addWidget(bp_title)
-
+        info_frame = QFrame()
+        info_frame.setStyleSheet(
+            "QFrame { background:#FFFFFF; border:1px solid #E0E0E0; border-radius:5px; }")
+        info_row = QHBoxLayout(info_frame)
+        info_row.setContentsMargins(8, 4, 8, 4)
+        info_title = QLabel("Build Platform:")
+        info_title.setStyleSheet("font-size:13px; color:#555; font-weight:bold;")
         self.bp_info_lbl = QLabel("—")
-        self.bp_info_lbl.setStyleSheet("font-size:14px; color:#1565C0; font-weight:bold;")
-        f3.addWidget(self.bp_info_lbl)
-        f3.addStretch()
-        sol.addWidget(g3)
+        self.bp_info_lbl.setStyleSheet("font-size:13px; color:#1565C0; font-weight:bold;")
+        info_row.addWidget(info_title)
+        info_row.addWidget(self.bp_info_lbl)
+        info_row.addStretch()
+        layout.addWidget(info_frame)
 
-        # --- Save Protocol (sol, dar) + Slice (sağ, geniş/birincil) ---
-        bottom_row = QHBoxLayout()
-        bottom_row.addStretch()
-
-        self.save_btn = QPushButton("Save Protocol")
-        self.save_btn.setFixedHeight(45)
-        self.save_btn.setStyleSheet("""
-            QPushButton {
-                font-size:16px; font-weight:bold; padding:8px 22px;
-                background:#66BB6A; color:white; border-radius:5px;
-            }
-            QPushButton:hover  { background:#43A047; }
-            QPushButton:pressed{ background:#388E3C; }
-        """)
-
-        self.slice_btn = QPushButton("Slice")
-        self.slice_btn.setFixedHeight(45)
-        self.slice_btn.setStyleSheet("""
-            QPushButton {
-                font-size:18px; font-weight:bold; padding:10px 55px;
-                background:#1976D2; color:white; border-radius:5px;
-            }
-            QPushButton:hover  { background:#1565C0; }
-            QPushButton:pressed{ background:#0D47A1; }
-            QPushButton:disabled{ background:#90CAF9; color:#e0e0e0; }
-        """)
-
-        bottom_row.addWidget(self.save_btn)
-        bottom_row.addSpacing(15)
-        bottom_row.addWidget(self.slice_btn)
-        bottom_row.addStretch()
-        sol.addLayout(bottom_row)
-
-        # --- Slice progress bar (hidden until a slice is running) ---
         self.slice_progress = QProgressBar()
         self.slice_progress.setRange(0, 100)
         self.slice_progress.setValue(0)
-        self.slice_progress.setTextVisible(True)
         self.slice_progress.setFormat("Slicing… %p%")
-        self.slice_progress.setFixedHeight(22)
+        self.slice_progress.setFixedHeight(18)
         self.slice_progress.setVisible(False)
-        self.slice_progress.setStyleSheet("""
-            QProgressBar {
-                font-size:13px; color:#212121;
-                background:#ECEFF1; border:1px solid #CFD8DC;
-                border-radius:5px; text-align:center;
-            }
-            QProgressBar::chunk { background:#1976D2; border-radius:4px; }
-        """)
-        sol.addSpacing(8)
-        sol.addWidget(self.slice_progress)
-        sol.addStretch()
+        layout.addWidget(self.slice_progress)
 
-        # --- Exit Application (Kiosk modu: tam ekrandan OS'e don) ---
-        # Kirmizi/dikkat cekici. Davranis controller'da baglanir (view-only kurali).
-        exit_row = QHBoxLayout()
+        actions = QHBoxLayout()
+        actions.setSpacing(8)
         self.exit_app_btn = QPushButton("Exit Application")
-        self.exit_app_btn.setFixedHeight(40)
-        self.exit_app_btn.setStyleSheet("""
-            QPushButton {
-                font-size:15px; font-weight:bold; padding:8px 24px;
-                background:#D32F2F; color:white; border-radius:5px; border:none;
+        self.save_btn = QPushButton("Save Protocol")
+        self.slice_btn = QPushButton("Slice")
+        for button in (self.exit_app_btn, self.save_btn, self.slice_btn):
+            button.setFixedHeight(36)
+            actions.addWidget(button)
+        self.exit_app_btn.setStyleSheet(self._action_style("#D32F2F", 14))
+        self.save_btn.setStyleSheet(self._action_style("#43A047", 14))
+        self.slice_btn.setStyleSheet(self._action_style("#1976D2", 15))
+        layout.addLayout(actions)
+        layout.addStretch(1)
+
+    @staticmethod
+    def _action_style(color: str, font_size: int) -> str:
+        return (
+            "QPushButton {"
+            f"font-size:{font_size}px; font-weight:bold; background:{color}; "
+            "color:white; border:none; border-radius:5px; padding:3px 9px;"
+            "} QPushButton:disabled { background:#B0BEC5; }"
+        )
+
+    def _create_spinbox(self, form: QFormLayout, label: str,
+                        min_v: float, max_v: float, decimals: int, step: float,
+                        suffix: str, default: float) -> QDoubleSpinBox:
+        label_widget = QLabel(label)
+        label_widget.setStyleSheet(LABEL_STYLE)
+        label_widget.setFixedWidth(175)
+        spin = self._configured_spinbox(
+            min_v, max_v, decimals, step, suffix, default)
+        form.addRow(label_widget, spin)
+        return spin
+
+    def _create_grid_spinbox(self, grid: QGridLayout, row: int, column: int,
+                             label: str, min_v: float, max_v: float,
+                             decimals: int, step: float, suffix: str,
+                             default: float) -> QDoubleSpinBox:
+        spin = self._configured_spinbox(
+            min_v, max_v, decimals, step, suffix, default)
+        self._add_grid_field(grid, row, column, label, spin)
+        return spin
+
+    @staticmethod
+    def _add_grid_field(grid: QGridLayout, row: int, column: int,
+                        label: str, widget: QWidget) -> None:
+        cell = QHBoxLayout()
+        cell.setSpacing(5)
+        label_widget = QLabel(label)
+        label_widget.setStyleSheet("font-size:13px; color:#555555;")
+        label_widget.setMinimumWidth(112)
+        cell.addWidget(label_widget)
+        cell.addWidget(widget)
+        cell.addStretch()
+        grid.addLayout(cell, row, column)
+
+    @staticmethod
+    def _configured_spinbox(min_v: float, max_v: float, decimals: int,
+                            step: float, suffix: str,
+                            default: float) -> QDoubleSpinBox:
+        spin = QDoubleSpinBox()
+        spin.setRange(min_v, max_v)
+        spin.setDecimals(decimals)
+        spin.setSingleStep(step)
+        spin.setSuffix(suffix)
+        spin.setValue(default)
+        spin.setFixedWidth(105)
+        spin.setFixedHeight(27)
+        spin.setAlignment(Qt.AlignmentFlag.AlignCenter)
+        spin.setStyleSheet(SPINBOX_STYLE)
+        return spin
+
+    def selected_printhead(self) -> int:
+        return normalize_selected_printhead(self.printhead_tabs.currentIndex() + 1)
+
+    def collect_printhead_profiles(self) -> dict[int, dict[str, float]]:
+        return {
+            head: {
+                key: float(widget.value())
+                for key, widget in self.printhead_widgets[head].items()
             }
-            QPushButton:hover  { background:#C62828; }
-            QPushButton:pressed{ background:#B71C1C; }
-        """)
-        exit_row.addWidget(self.exit_app_btn)
-        exit_row.addStretch()
-        sol.addLayout(exit_row)
+            for head in PRINTHEAD_IDS
+        }
 
-        main.addLayout(sol, 1)
-
-        right_placeholder = QFrame()
-        right_placeholder.setMinimumWidth(300)
-        right_placeholder.setStyleSheet("QFrame { background: transparent; border: none; }")
-        main.addWidget(right_placeholder, 1)
-
-        layout.addLayout(main)
-
-    def _create_spinbox(
-        self, form: QFormLayout, label: str,
-        min_v: float, max_v: float, dec: int, step: float,
-        suffix: str, default: float,
-    ) -> QDoubleSpinBox:
-        lbl = QLabel(label)
-        lbl.setStyleSheet(LABEL_STYLE)
-        lbl.setFixedWidth(190)
-
-        sb = QDoubleSpinBox()
-        sb.setRange(min_v, max_v)
-        sb.setDecimals(dec)
-        sb.setSingleStep(step)
-        sb.setSuffix(suffix)
-        sb.setValue(default)
-        sb.setFixedWidth(120)
-        sb.setAlignment(Qt.AlignmentFlag.AlignCenter)
-        sb.setStyleSheet(SPINBOX_STYLE)
-        form.addRow(lbl, sb)
-        return sb
+    def load_printhead_profiles(self, profiles: object,
+                                selected_printhead: object) -> None:
+        """Set every profile and active tab with all relevant signals blocked."""
+        normalized = normalize_printhead_profiles(profiles)
+        blockers: list[tuple[QWidget, bool]] = []
+        widgets = [self.printhead_tabs]
+        widgets.extend(
+            widget for head in PRINTHEAD_IDS
+            for widget in self.printhead_widgets[head].values()
+        )
+        try:
+            for widget in widgets:
+                blockers.append((widget, widget.blockSignals(True)))
+            for head in PRINTHEAD_IDS:
+                for key, widget in self.printhead_widgets[head].items():
+                    widget.setValue(normalized[head][key])
+            selected = normalize_selected_printhead(selected_printhead)
+            self.printhead_tabs.setCurrentIndex(selected - 1)
+        finally:
+            for widget, was_blocked in reversed(blockers):
+                widget.blockSignals(was_blocked)

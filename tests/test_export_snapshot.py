@@ -28,11 +28,10 @@ def run():
     w._slice_snapshot = w._pending_slice_snapshot
 
     # --- platform: 6-well, select A1 ---
-    w.platform_tab.btn_well.setChecked(True)
-    w.platform_tab.btn_6.setChecked(True)
-    w.platform_tab.well_buttons["A1"].setChecked(True)
-    if w.kutu_speed:
-        w.kutu_speed.setValue(10)
+    w.platform_tab.btn_well.click()
+    w.platform_tab.btn_6.click()
+    w.platform_tab.well_buttons["A1"].click()
+    w.settings_tab.print_speed_spins[1].setValue(10)
 
     # --- run the REAL export (monkeypatched dialogs) ---
     gcode = tempfile.NamedTemporaryFile(suffix=".gcode", delete=False); gcode.close()
@@ -46,15 +45,21 @@ def run():
     c.chk("right after export: slice NOT dirty", w._slice_is_dirty() is False)
     c.chk("right after export: export NOT dirty", w._export_is_dirty() is False)
 
+    # Nozzle Diameter is currently protocol-only; exporter/E math does not read it.
+    w.settings_tab.nozzle_diameter_spins[1].setValue(0.55)
+    c.chk("Nozzle Diameter change: slice stays clean", w._slice_is_dirty() is False)
+    c.chk("Nozzle Diameter change: export stays clean", w._export_is_dirty() is False)
+    w.settings_tab.nozzle_diameter_spins[1].setValue(0.40)
+
     # --- well selection change -> export dirty, slice clean ---
-    w.platform_tab.well_buttons["B3"].setChecked(True)   # now A1+B3
+    w.platform_tab.well_buttons["B3"].click()   # now A1+B3
     c.chk("A1 export then select B3: slice clean", w._slice_is_dirty() is False)
     c.chk("A1 export then select B3: export DIRTY", w._export_is_dirty() is True)
-    w.platform_tab.well_buttons["B3"].setChecked(False)  # back to A1
+    w.platform_tab.well_buttons["B3"].click()  # back to A1
     c.chk("restore well selection -> export not dirty", w._export_is_dirty() is False)
 
     # --- Test 7: change well selection, RE-EXPORT -> NOT dirty AND snapshot captures new origins ---
-    w.platform_tab.well_buttons["B3"].setChecked(True)          # A1+B3
+    w.platform_tab.well_buttons["B3"].click()          # A1+B3
     c.chk("Test7 well changed -> export DIRTY before re-export", w._export_is_dirty() is True)
     g7 = tempfile.NamedTemporaryFile(suffix=".gcode", delete=False); g7.close()
     QFileDialog.getSaveFileName = staticmethod(lambda *a, **k: (g7.name, ""))
@@ -63,11 +68,11 @@ def run():
     c.chk("Test7 re-export with new wells -> export NOT dirty", w._export_is_dirty() is False)
     c.chk("Test7 snapshot captured new origins (2 wells)",
           w._export_snapshot is not None
-          and w._export_snapshot.get("origins", (None,))[0] == "well"
-          and len(w._export_snapshot["origins"][1]) == 2,
-          str(w._export_snapshot.get("origins")) if w._export_snapshot else "None")
+          and w._export_snapshot.get("export_params", {}).get("platform") == "well"
+          and len(w._export_snapshot["export_params"]["plan"]) == 2,
+          str(w._export_snapshot.get("export_params")) if w._export_snapshot else "None")
     # restore A1-only export pointing back at the original file (keeps later deletions/tamper tests valid)
-    w.platform_tab.well_buttons["B3"].setChecked(False)
+    w.platform_tab.well_buttons["B3"].click()
     QFileDialog.getSaveFileName = staticmethod(lambda *a, **k: (gcode.name, ""))
     w._on_export_gcode()
     c.chk("Test7 restore A1 + re-export -> export NOT dirty", w._export_is_dirty() is False)
@@ -75,23 +80,24 @@ def run():
     except OSError: pass
 
     # --- printhead / tool change -> export dirty ---
-    if w.ph_buton_grubu:
-        w.ph_buton_grubu.button(2).setChecked(True)      # Printhead 2 -> T1
+    if w.printhead_tabs:
+        w.printhead_tabs.setCurrentIndex(1)      # Printhead 2 -> T1
         c.chk("T0 export then Printhead 2: slice clean", w._slice_is_dirty() is False)
-        c.chk("T0 export then Printhead 2: export DIRTY", w._export_is_dirty() is True)
-        w.ph_buton_grubu.button(1).setChecked(True)
+        c.chk("Well Plate tab switch: export stays clean", w._export_is_dirty() is False)
+        w.printhead_tabs.setCurrentIndex(0)
         c.chk("restore printhead -> export not dirty", w._export_is_dirty() is False)
 
     # --- print speed change -> export dirty ---
-    w.kutu_speed.setValue(20)
+    w.settings_tab.print_speed_spins[1].setValue(20)
     c.chk("speed 10 export then speed 20: slice clean", w._slice_is_dirty() is False)
     c.chk("speed 10 export then speed 20: export DIRTY", w._export_is_dirty() is True)
-    w.kutu_speed.setValue(10)
+    w.settings_tab.print_speed_spins[1].setValue(10)
     c.chk("restore speed -> export not dirty", w._export_is_dirty() is False)
 
     # --- temperature-only change -> export NOT dirty ---
-    if w.kutu_ph_temp:
-        w.kutu_ph_temp.blockSignals(True); w.kutu_ph_temp.setValue(40.0); w.kutu_ph_temp.blockSignals(False)
+    if w.settings_tab.printhead_temperature_spins[1]:
+        temp = w.settings_tab.printhead_temperature_spins[1]
+        temp.blockSignals(True); temp.setValue(40.0); temp.blockSignals(False)
     if w.kutu_plat_temp:
         w.kutu_plat_temp.blockSignals(True); w.kutu_plat_temp.setValue(-25.0); w.kutu_plat_temp.blockSignals(False)
     c.chk("temperature change only -> export NOT dirty", w._export_is_dirty() is False)
@@ -153,8 +159,8 @@ def run():
 
     # baseline @ layer 0.20, grid 0.40, STL A
     w.stl_dosya_yolu = stl.name
-    w.kutu_layer.setValue(0.20); w.kutu_distance.setValue(0.40); w.kutu_speed.setValue(10)
-    w.ph_buton_grubu.button(1).setChecked(True)
+    w.kutu_layer.setValue(0.20); w.kutu_distance.setValue(0.40); w.settings_tab.print_speed_spins[1].setValue(10)
+    w.printhead_tabs.setCurrentIndex(0)
     _mark_sliced(); _reexport()
     c.chk("baseline re-export clean", not w._export_is_dirty())
 
@@ -190,15 +196,15 @@ def run():
     # ================= FAILED EXPORT invalidates old export (Item 3) =====
     w.stl_dosya_yolu = stl.name; _mark_sliced(); _reexport()
     c.chk("pre-fail: snapshot+path valid", w._export_snapshot is not None and w._last_gcode_path is not None)
-    _og, _ogm = MWmod.generate_gcode, MWmod.generate_gcode_multi_origin
+    _og, _ogm = MWmod.generate_gcode, MWmod.generate_gcode_multi_head
     def _raise(*a, **k):
         raise ValueError("boom export")
-    MWmod.generate_gcode = _raise; MWmod.generate_gcode_multi_origin = _raise
+    MWmod.generate_gcode = _raise; MWmod.generate_gcode_multi_head = _raise
     gF = tempfile.NamedTemporaryFile(suffix=".gcode", delete=False); gF.close(); temp_files.append(gF.name)
     QFileDialog.getSaveFileName = staticmethod(lambda *a, **k: (gF.name, ""))
     QMessageBox.critical = staticmethod(lambda *a, **k: None)
     w._on_export_gcode()
-    MWmod.generate_gcode, MWmod.generate_gcode_multi_origin = _og, _ogm
+    MWmod.generate_gcode, MWmod.generate_gcode_multi_head = _og, _ogm
     c.chk("failed export -> _export_snapshot is None", w._export_snapshot is None)
     c.chk("failed export -> _last_gcode_path is None", w._last_gcode_path is None)
     up_ok, _ = _blocked()

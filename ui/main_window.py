@@ -24,7 +24,7 @@ except ImportError:   # 'requests' kurulu değilse uygulama yine de açılsın
 from PyQt6.QtWidgets import (
     QWidget, QHBoxLayout, QVBoxLayout, QPushButton, QStackedWidget, QLabel,
     QFrame, QButtonGroup, QListWidgetItem, QFileDialog, QInputDialog, QMessageBox,
-    QApplication,
+    QApplication, QSizePolicy,
 )
 from PyQt6.QtCore import QTimer, QThread, Qt, QObject, pyqtSignal
 
@@ -32,8 +32,12 @@ from core.viewport import (pv, QtInteractor, build_platform_grid, build_axis_arr
                            build_container_reference, CONTAINER_DEFAULTS, well_centers)
 from ui.styles import DIALOG_STYLE
 from core.slicer_worker import SliceWorker
-from core.gcode_exporter import generate_gcode, generate_gcode_multi_origin
+from core.gcode_exporter import generate_gcode, generate_gcode_multi_head
 from core.data_manager import DataManager
+from core.printhead import (
+    PRINTHEAD_IDS, PRINTHEAD_TO_HEATER, PRINTHEAD_TO_TOOL,
+    normalize_selected_printhead, normalize_well_assignments, used_printheads,
+)
 from ui.components import (
     SterilizationTab, ProtocolTab, PlatformTab, ModelTab,
     SettingsTab, PreviewTab, PrintTab,
@@ -515,10 +519,10 @@ class KlipperArayuzu(QWidget):
         self._model_actor = None              # (legacy) tek model aktoru — artik kullanilmiyor
         self._well_registry: dict = {}        # well_id -> {"center":(x,y), "wire":actor, "hitbox_name":str}
         self._container_actor_names: list = []  # mevcut kap aktor isimleri (temizlik)
-        self._selected_well = None            # (legacy) tek kuyu — coklu icin _selected_wells kullanilir
+        self.selected_printhead: int = 1
         self._picking_enabled: bool = False   # enable_mesh_picking yalnizca 1 kez kurulur
         # --- COKLU KUYU (well-plate) merkezi state ---
-        self._selected_wells: set = set()        # secili kuyu id kumesi (UI + 3D senkron)
+        self.well_assignments: dict[str, int] = {}
         self._loaded_model_mesh = None           # normalize STL mesh (memory'de; kuyulara kopyalanir)
         self._well_model_actor_names: list = []  # sahnedeki model kopya aktorlerinin adlari
         self.platform_config: dict = {}          # PlatformTab'den gelen son config
@@ -607,7 +611,10 @@ class KlipperArayuzu(QWidget):
     # ==========================================================
     def _setup_window(self) -> None:
         self.setWindowTitle("Klipper Control Interface")
-        self.resize(800, 480)
+        # Physical kiosk display contract.  Fixed geometry also prevents an
+        # oversized child sizeHint from silently expanding an offscreen/windowed
+        # validation instance beyond the real 800x480 panel.
+        self.setFixedSize(800, 480)
         self.setStyleSheet("QWidget { background-color: #F8F9FA; color: #212121; }")
 
         # Diyalog pencerelerini (QMessageBox / QInputDialog / QDialog) dokunmatik-
@@ -630,6 +637,11 @@ class KlipperArayuzu(QWidget):
         self.buton_grubu = QButtonGroup(self)
         self.buton_grubu.setExclusive(True)
         self.sayfalar_alani = QStackedWidget()
+        # The kiosk target is exactly 800x480.  Some child pages advertise a
+        # conservative sizeHint larger than the physical screen; the stack must
+        # accept the actual available rectangle instead of enlarging the window.
+        self.sayfalar_alani.setSizePolicy(
+            QSizePolicy.Policy.Ignored, QSizePolicy.Policy.Ignored)
         self.sekme_isimleri = [
             "Sterilization", "Protocol", "Built Platform",
             "Model", "Settings", "Preview", "Print",
@@ -738,22 +750,20 @@ class KlipperArayuzu(QWidget):
         self.uc_boyutlu_alan = self.model_tab.uc_boyutlu_alan
 
         # Settings
-        self.ph1_btn = self.settings_tab.ph1_btn
-        self.ph2_btn = self.settings_tab.ph2_btn
-        self.ph3_btn = self.settings_tab.ph3_btn
-        self.ph_buton_grubu = self.settings_tab.ph_buton_grubu
+        self.printhead_tabs = self.settings_tab.printhead_tabs
+        self.printhead_widgets = self.settings_tab.printhead_widgets
         self.ph_type_combo = self.settings_tab.ph_type_combo
         self.kutu_layer = self.settings_tab.kutu_layer
-        self.kutu_speed = self.settings_tab.kutu_speed
         self.kutu_grid = self.settings_tab.kutu_grid
         self.kutu_distance = self.settings_tab.kutu_distance
-        self.kutu_ph_temp = self.settings_tab.kutu_ph_temp
         self.kutu_plat_temp = self.settings_tab.kutu_plat_temp
         self.bp_info_lbl = self.settings_tab.bp_info_lbl
         self.save_btn = self.settings_tab.save_btn
         self.slice_btn = self.settings_tab.slice_btn
         self.slice_progress = self.settings_tab.slice_progress
         self.exit_app_btn = self.settings_tab.exit_app_btn
+        # One shared object: PlatformTab edits it; controller/exporter read it.
+        self.well_assignments = self.platform_tab.well_assignments
 
         # Preview (vertical layer slider only)
         self.layer_plotter_frame = self.preview_tab.layer_plotter_frame
@@ -855,19 +865,9 @@ class KlipperArayuzu(QWidget):
         if getattr(self, 'export_gcode_btn', None) is not None:
             self.export_gcode_btn.clicked.connect(self._on_export_gcode)
 
-        # Live sicaklik yonlendirme: spinbox degisikligi (ok tuslari dahil) aninda
-        # SET_HEATER_TEMPERATURE olarak Moonraker'a gider — ayri "Set" butonu YOK.
-        # Hedef peltier, AKTIF Printhead butonuna (ph_buton_grubu) gore secilir.
-        if self.kutu_ph_temp:
-            self.kutu_ph_temp.valueChanged.connect(self._on_ph_temp_changed)
         if self.kutu_plat_temp:
             self.kutu_plat_temp.valueChanged.connect(self._on_plat_temp_changed)
-
-        # Printhead butonu degisince (Printhead 1↔2↔3): spinbox degeri AYNI kaldigi
-        # icin valueChanged atesleme → yeni peltier eski hedefiyle kalir. Bu yuzden
-        # buton degisiminde guncel sicakligi YENI peltier'e elle yeniden gonder.
-        if self.ph_buton_grubu:
-            self.ph_buton_grubu.idClicked.connect(self._on_ph_group_clicked)
+        self.printhead_tabs.currentChanged.connect(self._on_printhead_tab_changed)
 
         self._set_print_btn_states(printing=False, paused=False)
 
@@ -915,176 +915,76 @@ class KlipperArayuzu(QWidget):
     # ==========================================================
     # PROTOCOL: OPEN
     # ==========================================================
-    def _open_protocol(self) -> None:
-        if not self.protokol_listesi:
-            return
-        item = self.protokol_listesi.currentItem()
-        if item is None:
-            QMessageBox.warning(self, "No Selection", "Lütfen açmak için bir protokol seçin.")
-            return
+    def _apply_protocol_data(self, values: dict) -> None:
+        """Load canonical protocol values into all UI/state without side effects."""
+        d = deepcopy(values)
+        self.settings_tab.load_printhead_profiles(
+            d.get("printheads"), d.get("selected_printhead", 1))
+        self.selected_printhead = self.settings_tab.selected_printhead()
+        self.platform_tab.load_platform(
+            d.get("bp_type", 0), d.get("bp_well_format", 6),
+            d.get("bp_dia", "60"), d.get("bp_size", "20x60"),
+            d.get("well_assignments", {}),
+        )
+        self.platform_config = self.platform_tab.get_platform_config()
+        self._rebuild_well_registry()
 
-        name = item.text()
-        record = self.kayitli_protokoller.get(name)
-        if not record or not record.get("degerler"):
-            QMessageBox.information(self, "Information", f"'{name}' has no saved values.")
-            return
-
-        d = deepcopy(record["degerler"])
-
-        ph_btn = self.ph_buton_grubu.button(d.get("ph_id", 1)) if self.ph_buton_grubu else None
-        if ph_btn:
-            ph_btn.setChecked(True)
-
-        bp_type = d.get("bp_type", 0)
-        bp_btn = self.bp_buton_grubu.button(bp_type) if self.bp_buton_grubu else None
-        if bp_btn:
-            bp_btn.setChecked(True)
-        if self.bp_stacked:
-            self.bp_stacked.setCurrentIndex(bp_type)
-
-        if bp_type == 0 and self.in_dia:
-            self.in_dia.setText(d.get("bp_dia", "60"))
-        elif bp_type == 1:
-            wf = d.get("bp_well_format", 6)
-            if wf == 6 and self.btn_6:
-                self.btn_6.setChecked(True)
-            elif wf == 12 and self.btn_12:
-                self.btn_12.setChecked(True)
-        elif bp_type == 2:
-            parts = d.get("bp_size", "20x60").split("x", 1)
-            if self.in_size_x:
-                self.in_size_x.setText(parts[0] if parts else "20")
-            if self.in_size_y:
-                self.in_size_y.setText(parts[1] if len(parts) > 1 else "60")
-
-        if self.kutu_layer:
-            self.kutu_layer.setValue(d.get("layer", 0.2))
-        if self.kutu_speed:
-            self.kutu_speed.setValue(d.get("speed", 10.0))
+        for widget, value in (
+            (self.kutu_layer, d.get("layer", 0.2)),
+            (self.kutu_distance, d.get("distance", 0.2)),
+            (self.kutu_plat_temp, d.get("plat_temp", -30.0)),
+        ):
+            if widget is None:
+                continue
+            was_blocked = widget.blockSignals(True)
+            try:
+                widget.setValue(value)
+            finally:
+                widget.blockSignals(was_blocked)
         if self.kutu_grid:
-            # Desteklenen TEK grid tipi Linear: kayitli deger ne olursa olsun
-            # (eski / bilinmeyen / bos dahil) ACIKCA Linear'a normalize et.
+            was_blocked = self.kutu_grid.blockSignals(True)
             self.kutu_grid.setCurrentText("Linear")
-        if self.kutu_distance:
-            self.kutu_distance.setValue(d.get("distance", 0.2))
-        # blockSignals: programatik setValue (protokol yukle/sec) valueChanged'i
-        # TETIKLEMESIN — yoksa listede gezinmek/protokol acmak bile isiticilara
-        # SET_HEATER_TEMPERATURE gonderirdi. SADECE kullanicinin elle degisikligi gider.
-        if self.kutu_ph_temp:
-            self.kutu_ph_temp.blockSignals(True)
-            self.kutu_ph_temp.setValue(d.get("ph_temp", 27.0))
-            self.kutu_ph_temp.blockSignals(False)
-        if self.kutu_plat_temp:
-            self.kutu_plat_temp.blockSignals(True)
-            self.kutu_plat_temp.setValue(d.get("plat_temp", -30.0))
-            self.kutu_plat_temp.blockSignals(False)
+            self.kutu_grid.blockSignals(was_blocked)
 
-        # Well Plate secili kuyularini arayuze + merkezi state'e yansit (emit YOK →
-        # dongu olmaz). _show_stl (varsa) kabi + model kopyalarini bu secime gore cizer.
-        wells = d.get("bp_selected_wells", [])
-        self.platform_tab.set_selected_wells(wells, emit_signal=False)
-        self._selected_wells = set(wells)
-
+        self._draw_container()
+        self._update_model_copies()
         self._update_platform_info()
-
         stl_path = d.get("stl_path", "")
         if stl_path and Path(stl_path).exists():
             self.stl_dosya_yolu = stl_path
             self._show_stl(stl_path)
 
-        self._switch_to_settings()
-
-    # ==========================================================
-    # PROTOCOL: EDIT
-    # ==========================================================
-    def _edit_protocol(self) -> None:
-        """Load selected protocol values into Settings and switch to Settings tab."""
+    def _selected_protocol_record(self, action: str):
         if not self.protokol_listesi:
-            return
-
+            return None
         item = self.protokol_listesi.currentItem()
         if item is None:
-            QMessageBox.information(self, "No Selection", "Please select a protocol to edit.")
-            return
-
-        name = item.text()
-        record = self.kayitli_protokoller.get(name)
-
+            QMessageBox.information(
+                self, "No Selection", f"Please select a protocol to {action}.")
+            return None
+        record = self.kayitli_protokoller.get(item.text())
         if not record or not record.get("degerler"):
             QMessageBox.information(
-                self, "Information",
-                f"'{name}' has no saved values.\n"
-                "You can enter new values in the Settings tab and save over it.",
-            )
-            self._switch_to_settings()
+                self, "Information", f"'{item.text()}' has no saved values.")
+            return None
+        return item.text(), record
+
+    def _open_protocol(self) -> None:
+        selected = self._selected_protocol_record("open")
+        if selected is None:
             return
-
-        d = deepcopy(record["degerler"])
-
-        ph_btn = self.ph_buton_grubu.button(d.get("ph_id", 1)) if self.ph_buton_grubu else None
-        if ph_btn:
-            ph_btn.setChecked(True)
-
-        bp_type = d.get("bp_type", 0)
-        bp_btn = self.bp_buton_grubu.button(bp_type) if self.bp_buton_grubu else None
-        if bp_btn:
-            bp_btn.setChecked(True)
-        if self.bp_stacked:
-            self.bp_stacked.setCurrentIndex(bp_type)
-
-        if bp_type == 0 and self.in_dia:
-            self.in_dia.setText(d.get("bp_dia", "60"))
-        elif bp_type == 1:
-            wf = d.get("bp_well_format", 6)
-            if wf == 6 and self.btn_6:
-                self.btn_6.setChecked(True)
-            elif wf == 12 and self.btn_12:
-                self.btn_12.setChecked(True)
-        elif bp_type == 2:
-            parts = d.get("bp_size", "20x60").split("x", 1)
-            if self.in_size_x:
-                self.in_size_x.setText(parts[0] if parts else "20")
-            if self.in_size_y:
-                self.in_size_y.setText(parts[1] if len(parts) > 1 else "60")
-
-        if self.kutu_layer:
-            self.kutu_layer.setValue(d.get("layer", 0.2))
-        if self.kutu_speed:
-            self.kutu_speed.setValue(d.get("speed", 10.0))
-        if self.kutu_grid:
-            # Desteklenen TEK grid tipi Linear: kayitli deger ne olursa olsun
-            # (eski / bilinmeyen / bos dahil) ACIKCA Linear'a normalize et.
-            self.kutu_grid.setCurrentText("Linear")
-        if self.kutu_distance:
-            self.kutu_distance.setValue(d.get("distance", 0.2))
-        # blockSignals: programatik setValue (protokol yukle/sec) valueChanged'i
-        # TETIKLEMESIN — yoksa listede gezinmek/protokol acmak bile isiticilara
-        # SET_HEATER_TEMPERATURE gonderirdi. SADECE kullanicinin elle degisikligi gider.
-        if self.kutu_ph_temp:
-            self.kutu_ph_temp.blockSignals(True)
-            self.kutu_ph_temp.setValue(d.get("ph_temp", 27.0))
-            self.kutu_ph_temp.blockSignals(False)
-        if self.kutu_plat_temp:
-            self.kutu_plat_temp.blockSignals(True)
-            self.kutu_plat_temp.setValue(d.get("plat_temp", -30.0))
-            self.kutu_plat_temp.blockSignals(False)
-
-        # Well Plate secili kuyularini arayuze + merkezi state'e yansit (emit YOK).
-        wells = d.get("bp_selected_wells", [])
-        self.platform_tab.set_selected_wells(wells, emit_signal=False)
-        self._selected_wells = set(wells)
-        # Preview/export icin merkezleri tazele; sonra Model sahnesinde referans
-        # kabi (salt-gorsel) + secili kuyulara model kopyalarini tazele
-        # (plotter yoksa hepsi no-op).
-        self._rebuild_well_registry()
-        self._draw_container()
-        self._update_model_copies()
-
-        self._update_platform_info()
-
-        self._editing_protocol_name = name
+        _name, record = selected
+        self._apply_protocol_data(record["degerler"])
         self._switch_to_settings()
 
+    def _edit_protocol(self) -> None:
+        selected = self._selected_protocol_record("edit")
+        if selected is None:
+            return
+        name, record = selected
+        self._apply_protocol_data(record["degerler"])
+        self._editing_protocol_name = name
+        self._switch_to_settings()
     def _switch_to_settings(self) -> None:
         """Helper to switch view to the Settings tab (index 4)."""
         if self.buton_grubu:
@@ -1130,31 +1030,31 @@ class KlipperArayuzu(QWidget):
     # SETTINGS DATA COLLECTION
     # ==========================================================
     def _collect_settings_data(self) -> dict:
-        """Gather all current values from the Settings page into a plain dict."""
-        ph_id = self.ph_buton_grubu.checkedId() if self.ph_buton_grubu else 1
+        """Gather the canonical protocol state from the shared UI model."""
+        self.selected_printhead = self.settings_tab.selected_printhead()
         bp_type = self.bp_buton_grubu.checkedId() if self.bp_buton_grubu else 0
-
-        bp_dia = self.in_dia.text() if self.in_dia else "60"
-        bp_wf = 12 if (self.btn_12 and self.btn_12.isChecked()) else 6
-        bp_size = f"{self.in_size_x.text() if self.in_size_x else '20'}x{self.in_size_y.text() if self.in_size_y else '60'}"
-
+        well_format = 12 if (self.btn_12 and self.btn_12.isChecked()) else 6
+        assignments = (normalize_well_assignments(self.well_assignments, well_format)
+                       if bp_type == 1 else {})
         return {
-            "ph_id": ph_id,
+            "selected_printhead": self.selected_printhead,
+            "printheads": self.settings_tab.collect_printhead_profiles(),
+            "well_assignments": assignments,
             "bp_type": bp_type,
-            "bp_dia": bp_dia,
-            "bp_well_format": bp_wf,
-            "bp_size": bp_size,
-            "bp_selected_wells": sorted(self._selected_wells),
+            "bp_dia": self.in_dia.text() if self.in_dia else "60",
+            "bp_well_format": well_format,
+            "bp_size": (
+                f"{self.in_size_x.text() if self.in_size_x else '20'}x"
+                f"{self.in_size_y.text() if self.in_size_y else '60'}"
+            ),
             "layer": self.kutu_layer.value() if self.kutu_layer else 0.0,
-            "speed": self.kutu_speed.value() if self.kutu_speed else 0.0,
-            "grid": "Linear",   # desteklenen tek deger; currentText'e bagli kalma
+            "grid": "Linear",
             "distance": self.kutu_distance.value() if self.kutu_distance else 0.0,
-            "ph_temp": self.kutu_ph_temp.value() if self.kutu_ph_temp else 0.0,
             "plat_temp": self.kutu_plat_temp.value() if self.kutu_plat_temp else 0.0,
-            "model_name": Path(self.stl_dosya_yolu).name if self.stl_dosya_yolu else "Not Selected",
+            "model_name": (
+                Path(self.stl_dosya_yolu).name if self.stl_dosya_yolu else "Not Selected"),
             "stl_path": self.stl_dosya_yolu or "",
         }
-
     # ==========================================================
     # PROTOCOL: SAVE
     # ==========================================================
@@ -1234,7 +1134,10 @@ class KlipperArayuzu(QWidget):
         if self.protokol_detay_alani:
             self.protokol_detay_alani.setText(detail)
 
-        self._editing_protocol_name = None
+        # A failed disk write remains an active edit: the in-memory snapshot is
+        # retained, but the user must be able to retry the same save explicitly.
+        if wrote_disk:
+            self._editing_protocol_name = None
 
         # Basari mesaji SADECE disk yazimi basariliysa. Aksi halde yukarida
         # "Save Error" gosterildi; burada YANILTICI "saved successfully" gostermeyiz.
@@ -1588,44 +1491,16 @@ class KlipperArayuzu(QWidget):
     # icin TEK gonderim yolu vardir — gizli ikinci transport (double-start riski) yok.
     # (PA8 = uv_led, PC5 = hepa_fan pinleri; START_UV/STOP_UV/START_HEPA/STOP_HEPA makrolari.)
 
-    def _on_ph_temp_changed(self, value: float) -> None:
-        """Printhead Temperature spinbox → AKTIF peltier'e canli sicaklik hedefi.
-
-        Hangi peltier? ph_buton_grubu'nun checked id'si (Printhead 1/2/3 → grup id
-        1/2/3 → peltier_1/2/3). Hicbiri secili degilse (-1) guvenli varsayilan
-        peltier_1. Fire-and-forget; GUI'yi asla bloklamaz.
-        """
-        ph_id = self.ph_buton_grubu.checkedId() if self.ph_buton_grubu else 1
-        target = {1: "peltier_1", 2: "peltier_2", 3: "peltier_3"}.get(ph_id, "peltier_1")
-        self._send_moonraker_request(
-            "/printer/gcode/script",
-            {"script": f"SET_HEATER_TEMPERATURE HEATER={target} TARGET={value:.1f}"},
-        )
+    def _on_printhead_tab_changed(self, index: int) -> None:
+        """Select the Petri/Glass profile only; never send hardware commands."""
+        self.selected_printhead = normalize_selected_printhead(index + 1)
 
     def _on_plat_temp_changed(self, value: float) -> None:
-        """Platform Temperature spinbox → yatak sogutucu (temperature_fan bed_cooler) hedefi."""
+        """Platform temperature keeps its existing live bed-cooler behavior."""
         self._send_moonraker_request(
             "/printer/gcode/script",
             {"script": f"SET_TEMPERATURE_FAN_TARGET temperature_fan=bed_cooler target={value:.1f}"},
         )
-
-    def _on_ph_group_clicked(self, checked_id: int) -> None:
-        """Printhead butonu degisince guncel spinbox sicakligini YENI peltier'e gonder.
-
-        checked_id = ph_buton_grubu'nun yeni secili buton id'si (1/2/3 →
-        peltier_1/2/3); bilinmeyen id guvenli varsayilan peltier_1. Spinbox yoksa
-        (kutu_ph_temp None) sessizce cik. Fire-and-forget; GUI'yi bloklamaz.
-        Map + format, _on_ph_temp_changed ile bilerek ayni tutuldu.
-        """
-        if self.kutu_ph_temp is None:
-            return
-        target = {1: "peltier_1", 2: "peltier_2", 3: "peltier_3"}.get(checked_id, "peltier_1")
-        value = self.kutu_ph_temp.value()
-        self._send_moonraker_request(
-            "/printer/gcode/script",
-            {"script": f"SET_HEATER_TEMPERATURE HEATER={target} TARGET={value:.1f}"},
-        )
-
     def _start_uv(self) -> None:
         if not self.uv_zaman_kutusu or not self.uv_start_btn or not self.uv_kalan_sure_lbl:
             return
@@ -1898,6 +1773,12 @@ class KlipperArayuzu(QWidget):
     # PLATFORM CONFIRM
     # ==========================================================
     def _confirm_platform(self) -> None:
+        if ((self.bp_buton_grubu.checkedId() if self.bp_buton_grubu else 0) == 1
+                and not self.well_assignments):
+            QMessageBox.warning(
+                self, "Well Assignment Required",
+                "Select at least one well and assign it to PH1, PH2 or PH3.")
+            return
         self._update_platform_info()
         if self.buton_grubu:
             btn = self.buton_grubu.button(3)
@@ -2013,7 +1894,10 @@ class KlipperArayuzu(QWidget):
             self._well_registry = {wid: {"center": c}
                                    for wid, c in well_centers(fmt).items()}
             # Guvenlik agi: format degisince gecersiz kalan secimleri ayikla.
-            self._selected_wells &= set(self._well_registry.keys())
+            valid = set(self._well_registry)
+            for well_id in tuple(self.well_assignments):
+                if well_id not in valid:
+                    del self.well_assignments[well_id]
 
     # ==========================================================
     # PLATFORM CONFIG (PlatformTab.platform_changed alicisi)
@@ -2022,7 +1906,7 @@ class KlipperArayuzu(QWidget):
         """PlatformTab secim/format/tip degisimini merkezi state'e + Model sahnesine
         yansitir. Kuyu seciminin TEK kaynagi PlatformTab'dir (Model sekmesinde
         tiklama secim degistirmez). Sira:
-          1) _selected_wells merkezi state'i (Preview + export kaynagi) guncellenir,
+          1) well_assignments merkezi state'i guncellenir,
           2) kuyu-merkez registry'si veriden yeniden kurulur (Preview/export icin),
           3) kap REFERANS geometrisi YALNIZCA type/format degisince yeniden cizilir
              (RPi4: her kuyu tiklamasi tum kap aktorlerini yeniden kurmasin),
@@ -2030,7 +1914,6 @@ class KlipperArayuzu(QWidget):
           5) Settings build-platform bilgi etiketi tazelenir.
         """
         self.platform_config = config or {}
-        self._selected_wells = set(self.platform_config.get("selected_wells", []))
         self._rebuild_well_registry()
         sig = self._container_signature_of(self.platform_config)
         if sig != self._container_signature:
@@ -2054,7 +1937,7 @@ class KlipperArayuzu(QWidget):
         """Secili kuyu wireframe'lerini acik mavi, digerlerini turuncu yapar."""
         for wid, info in getattr(self, "_well_registry", {}).items():
             try:
-                info["wire"].prop.color = "#33B5E5" if wid in self._selected_wells else "#F4511E"
+                info["wire"].prop.color = "#33B5E5" if wid in self.well_assignments else "#F4511E"
             except Exception:
                 pass
         if render:
@@ -2102,8 +1985,8 @@ class KlipperArayuzu(QWidget):
                             (ad: model_copy_<well_id>). Secili kuyu YOKSA kopya yok.
         Kopya sayisi = secili kuyu sayisi. TUM kopyalar pickable=False (Model
         sekmesi salt-goruntuleme; tiklama ile ekleme/silme YOK). Coklu-kuyu
-        cogaltimi ayrica Preview + generate_gcode_multi_origin tarafinda yasar.
-        Kuyu SECIMININ TEK kaynagi PlatformTab.selected_wells'tir.
+        cogaltimi ayrica export tarafinda yasar.
+        Kuyu planinin TEK kaynagi paylasilan well_assignments sozlugudur.
         """
         if pv is None or getattr(self, "plotter", None) is None:
             return
@@ -2130,7 +2013,7 @@ class KlipperArayuzu(QWidget):
             self._well_model_actor_names.append("model_copy_center")
         else:
             # Well Plate -> secili her gecerli kuyu icin bir kopya, kuyu merkezinde.
-            for well_id in sorted(self._selected_wells):
+            for well_id in sorted(self.well_assignments):
                 info = self._well_registry.get(well_id)
                 if not info:
                     continue
@@ -2161,7 +2044,7 @@ class KlipperArayuzu(QWidget):
         if kind_id != 1:
             return [("", 0.0, 0.0)]
         origins = []
-        for wid in sorted(self._selected_wells):
+        for wid in sorted(self.well_assignments):
             info = self._well_registry.get(wid)
             if info:
                 cx, cy = info["center"]
@@ -2415,67 +2298,53 @@ class KlipperArayuzu(QWidget):
             return True
         return self._current_slice_params() != snap
 
-    def _export_origins_signature(self):
-        """Export'un uretecegi origin'lerin KARSILASTIRILABILIR imzasi.
-
-        Well Plate: ('well', ((wid, bed_x, bed_y), ...)) — kuyu SECIMI ve FORMAT
-        degisimini yakalar (registry merkezleri formatla degisir). Petri/Glass:
-        ('single', bed_x, bed_y). Sicaklik/slider/UV-HEPA bunu ETKILEMEZ.
-        """
+    def _current_export_params(self) -> dict:
+        """Only settings that materially change emitted G-code."""
         kind_id = self.bp_buton_grubu.checkedId() if self.bp_buton_grubu else 0
+        profiles = self.settings_tab.collect_printhead_profiles()
         bed_cx, bed_cy = 120.0, 60.0
         if kind_id == 1:
-            sig = []
-            for wid in sorted(self._selected_wells):
-                info = getattr(self, "_well_registry", {}).get(wid)
+            plan = []
+            for well_id, head in sorted(self.well_assignments.items()):
+                info = self._well_registry.get(well_id)
                 if info and "center" in info:
                     cx, cy = info["center"]
-                    sig.append((wid, round(bed_cx + cx, 3), round(bed_cy + cy, 3)))
-            return ("well", tuple(sig))
-        return ("single", round(bed_cx, 3), round(bed_cy, 3))
-
-    def _current_export_params(self) -> dict:
-        """Export'u ETKILEYEN mevcut parametreler: origins + active_tool + speed.
-
-        Printhead SICAKLIGI / platform sicakligi / Preview slider / UV-HEPA
-        BURADA YOK (bunlar export'u dirty YAPMAZ). Slice-dirty ayri kontrol edilir.
-        """
-        ph_id = self.ph_buton_grubu.checkedId() if self.ph_buton_grubu else 1
-        active_tool = {1: "T0", 2: "T1", 3: "T2"}.get(ph_id, "T0")
-        speed = float(self.kutu_speed.value()) if self.kutu_speed else 10.0
-        return {"origins": self._export_origins_signature(),
-                "active_tool": active_tool, "print_speed": speed}
+                    plan.append((
+                        well_id, head,
+                        round(bed_cx + cx, 3), round(bed_cy + cy, 3),
+                    ))
+            heads = used_printheads(1, self.selected_printhead, self.well_assignments)
+            speeds = tuple((head, profiles[head]["print_speed_mm_s"]) for head in heads)
+            return {
+                "platform": "well",
+                "well_format": 12 if self.btn_12.isChecked() else 6,
+                "plan": tuple(plan),
+                "speeds": speeds,
+            }
+        self.selected_printhead = self.settings_tab.selected_printhead()
+        head = self.selected_printhead
+        return {
+            "platform": "single",
+            "origin": (bed_cx, bed_cy),
+            "head": head,
+            "tool": PRINTHEAD_TO_TOOL[head],
+            "speed": profiles[head]["print_speed_mm_s"],
+        }
 
     def _export_is_dirty(self) -> bool:
-        """True → son export'lanan G-code artik gecerli DEGIL (yeniden Export gerekli).
-
-        Dirty: export snapshot yok · slice dirty · G-code dosyasi silinmis/disaridan
-        degistirilmis · origins (kuyu secimi/format) · active_tool (printhead) ya da
-        print_speed degismis. Sicaklik/slider/UV-HEPA dirty YAPMAZ.
-        """
         snap = self._export_snapshot
-        if not snap:
+        if not snap or self._slice_is_dirty():
             return True
-        if self._slice_is_dirty():           # slice geometri parametresi degistiyse
-            return True
-        # KRITIK: son export'un dayandigi slice snapshot'i GUNCEL slice snapshot'i
-        # ile ayni mi? Ayni ayarlarla YENIDEN slice yapildiginda _slice_is_dirty
-        # False olur ama G-code ESKI slice'a aittir (ornegin 0.20 export → 0.10
-        # yeniden slice → yeniden export YOK) → export DIRTY. Farkli snapshot kesin
-        # dirty; ayni snapshot (deterministik) korunur.
         if snap.get("slice_snapshot") != self._slice_snapshot:
             return True
-        try:                                  # G-code dosya kimligi (silinmis/degismis)
-            st = Path(snap.get("gcode_path", "")).stat()
-            if st.st_size != snap.get("gcode_size") or st.st_mtime_ns != snap.get("gcode_mtime_ns"):
+        try:
+            stat = Path(snap.get("gcode_path", "")).stat()
+            if (stat.st_size != snap.get("gcode_size")
+                    or stat.st_mtime_ns != snap.get("gcode_mtime_ns")):
                 return True
         except OSError:
             return True
-        cur = self._current_export_params()   # origins / tool / speed
-        return (cur["origins"] != snap.get("origins")
-                or cur["active_tool"] != snap.get("active_tool")
-                or cur["print_speed"] != snap.get("print_speed"))
-
+        return self._current_export_params() != snap.get("export_params")
     def _slice_model(self) -> None:
         # Re-entrancy guard: ignore a second request while one is in flight.
         # (slice_btn is disabled during slicing, but this hardens other paths.)
@@ -2765,9 +2634,10 @@ class KlipperArayuzu(QWidget):
         if self.print_btn:
             self.print_btn.setEnabled(False)
         bridge = self._moonraker_bridge
+        temperature_plan = self._print_temperature_plan()
 
         def _worker() -> None:
-            ok, info = self._upload_gcode_to_moonraker(local_path)
+            ok, info = self._upload_and_preflight(local_path, temperature_plan)
             # info = basarida Moonraker dosya adi/path, hatada hata mesaji.
             try:
                 bridge.gcode_upload_finished.emit(bool(ok), info if ok else "", info)
@@ -2775,6 +2645,64 @@ class KlipperArayuzu(QWidget):
                 pass   # kapanista koprunun C++ tarafi silinmis olabilir
 
         threading.Thread(target=_worker, daemon=True, name="gcode-upload").start()
+
+    def _upload_and_preflight(self, local_path: str,
+                              temperature_plan) -> tuple[bool, str]:
+        """Worker-stage upload followed by confirmed temperature delivery."""
+        ok, info = self._upload_gcode_to_moonraker(local_path)
+        if not ok:
+            return False, info
+        temperatures_ok, temperature_message = (
+            self._deliver_temperature_preflight_blocking(temperature_plan))
+        if not temperatures_ok:
+            return False, temperature_message
+        return True, info
+
+    def _print_temperature_plan(self) -> tuple[tuple[int, str, float], ...]:
+        """Plain-data temperature plan captured on the GUI thread before upload."""
+        platform_type = self.bp_buton_grubu.checkedId() if self.bp_buton_grubu else 0
+        self.selected_printhead = self.settings_tab.selected_printhead()
+        profiles = self.settings_tab.collect_printhead_profiles()
+        heads = used_printheads(
+            platform_type, self.selected_printhead, self.well_assignments)
+        return tuple(
+            (head, PRINTHEAD_TO_HEATER[head], profiles[head]["temperature_c"])
+            for head in heads
+        )
+
+    def _deliver_temperature_preflight_blocking(
+            self, plan: tuple[tuple[int, str, float], ...]) -> tuple[bool, str]:
+        """Deliver used-head targets in the upload worker; failure blocks print start."""
+        delivered: list[tuple[int, str]] = []
+        seen_heaters: set[str] = set()
+        for head, heater, target in plan:
+            if heater in seen_heaters:
+                continue
+            seen_heaters.add(heater)
+            command = (
+                f"SET_HEATER_TEMPERATURE HEATER={heater} TARGET={target:.1f}")
+            last_message = ""
+            for attempt in range(1, 4):
+                ok, last_message = self._post_moonraker_blocking(
+                    "/printer/gcode/script", {"script": command})
+                if ok:
+                    break
+                if attempt < 3:
+                    time.sleep(0.15 * attempt)
+            if not ok:
+                delivered_text = (
+                    ", ".join(f"PH{done_head} ({done_heater})"
+                              for done_head, done_heater in delivered)
+                    if delivered else "none"
+                )
+                return False, (
+                    f"PH{head} temperature target could not be delivered: "
+                    f"{last_message}. Earlier targets delivered: {delivered_text}. "
+                    "Automatic rollback was not attempted because this project has "
+                    "no verified TARGET=0 heater-off path; physical heater state is "
+                    "UNKNOWN and requires a manual safety decision.")
+            delivered.append((head, heater))
+        return True, "all used printhead targets delivered"
 
     def _enter_printing_ui(self, reset_timer: bool) -> None:
         """UI'yi 'printing' moduna al (timer + butonlar). reset_timer=True taze baslangic."""
@@ -2851,7 +2779,7 @@ class KlipperArayuzu(QWidget):
         if not success:
             # UI 'printing' moduna GECMEDI; Print butonunu geri ac + hatayi goster.
             self._set_print_btn_states(printing=False, paused=False)
-            self._show_banner(f"Baski baslatilamadi (yukleme): {message}", kind="error")
+            self._show_banner(f"Baski baslatilamadi: {message}", kind="error")
             return
         # Upload OK → gercek baskiyi baslat.
         self._start_uploaded_gcode(filename)
@@ -3049,10 +2977,10 @@ class KlipperArayuzu(QWidget):
             self._render_last_idx = idx
 
         # ── 3. ACTIVE LAYER (full, instant) — TEK MERKEZ KOPYA ──────────────
-        # Preview her ZAMAN tek modeli temsil eder: selected_wells KAC olursa
+        # Preview her ZAMAN tek modeli temsil eder: atama sayisi KAC olursa
         # olsun burada TEK aktif katman cizilir (local origin 0,0; XY translate
         # YOK). Coklu-kuyu cogaltimi yalnizca Model sekmesinde ve G-code
-        # export'ta (generate_gcode_multi_origin) yasar — Preview'da DEGIL.
+        # coklu-kuyu cogaltimi export'ta yasar — Preview'da DEGIL.
         # Onceki kare(ler)den kalabilecek TUM aktif/legacy aktorleri temizle:
         # sabit isimliler + eski per-well (active_perimeter_A1 / infill_A1 /
         # ghost_A1) + eski 'infill_v'. Boylece slider hareketinde geometry birikmez.
@@ -3115,132 +3043,102 @@ class KlipperArayuzu(QWidget):
         self._show_layer(self._pending_layer_idx)
 
     def _on_export_gcode(self) -> None:
-        """Export the sliced model to a continuous-extrusion G-code file."""
+        """Export canonical single- or multi-printhead plans."""
         if not self._slices:
-            QMessageBox.warning(self, "G-Code Yok",
-                                "Önce Settings sekmesinden bir model dilimleyin.")
+            QMessageBox.warning(
+                self, "G-Code Yok", "Önce Settings sekmesinden bir model dilimleyin.")
             return
-        # Section 10 dirty-state: slice'tan sonra geometri-etkileyen ayar (STL /
-        # layer height / grid distance) degistiyse ESKI slice ile export YAPILMAZ.
         if self._slice_is_dirty():
-            QMessageBox.warning(self, "Yeniden Slice Gerekli",
-                                "Dilimleme ayarları değişti. Yeniden Slice yapın.")
+            QMessageBox.warning(
+                self, "Yeniden Slice Gerekli",
+                "Dilimleme ayarları değişti. Yeniden Slice yapın.")
             return
         path, _ = QFileDialog.getSaveFileName(
             self, "G-Code Dışa Aktar", "output.gcode", "G-Code (*.gcode)")
         if not path:
             return
 
-        # Layer height'i Settings widget'indan DEGIL slice SNAPSHOT'undan al →
-        # export edilen G-code, dilimlenen geometriyle her zaman tutarli kalir.
-        layer_h = (self._slice_snapshot or {}).get(
+        layer_height = (self._slice_snapshot or {}).get(
             "layer_height", self.kutu_layer.value() if self.kutu_layer else 0.2)
-        bed_cx, bed_cy = 120.0, 60.0   # Klipper makro yatak merkezi (X120 Y60)
-
-        # Aktif baski kafasi -> tool makrosu (Printhead 1/2/3 -> T0/T1/T2).
-        ph_id = self.ph_buton_grubu.checkedId() if self.ph_buton_grubu else 1
-        active_tool = {1: "T0", 2: "T1", 3: "T2"}.get(ph_id, "T0")
-        # Baski hizi (mm/s) -> feedrate (mm/dk).
-        speed_mms = self.kutu_speed.value() if self.kutu_speed else 10
-        print_speed = max(1.0, float(speed_mms)) * 60.0
-
-        # Well Plate ise: secili her kuyuya AYNI modelin kopyasi (tek dosya, coklu
-        # origin). Diger platformlarda (petri/glass) eski tek-origin yol korunur.
         is_well = (self.bp_buton_grubu.checkedId() if self.bp_buton_grubu else 0) == 1
-        origins = None
+        profiles = self.settings_tab.collect_printhead_profiles()
+        bed_cx, bed_cy = 120.0, 60.0
+        head_origins: dict[int, list[tuple[str, float, float]]] = {
+            head: [] for head in PRINTHEAD_IDS
+        }
         if is_well:
-            if not self._selected_wells:
+            if not self.well_assignments:
                 QMessageBox.warning(
-                    self, "Kuyu Secilmedi",
-                    "Well Plate secildi fakat kuyu secilmedi.\n"
-                    "Lütfen A1, A2 gibi en az bir kuyu seçin.")
+                    self, "Kuyu Ataması Yok",
+                    "Select at least one well and assign it to PH1, PH2 or PH3.")
                 return
-            origins = []
-            for wid in sorted(self._selected_wells):
-                info = getattr(self, "_well_registry", {}).get(wid)
+            for well_id, head in sorted(self.well_assignments.items()):
+                info = self._well_registry.get(well_id)
                 if info and "center" in info:
                     cx, cy = info["center"]
-                    origins.append((wid, bed_cx + cx, bed_cy + cy))
-            if not origins:
+                    head_origins[head].append(
+                        (well_id, bed_cx + cx, bed_cy + cy))
+            if not any(head_origins.values()):
                 QMessageBox.warning(
                     self, "Kuyu Merkezleri Yok",
-                    "Secili kuyularin merkezleri bulunamadi. Önce Model sekmesinden "
-                    "STL yükleyip Well Plate kabini çizdirin.")
+                    "Atanmış kuyuların merkezleri bulunamadı.")
                 return
 
-        # Item 3: URETIM BASLAMADAN ONCE eski export'u GECERSIZ kil. Generation
-        # (generate_gcode / multi_origin) ya da stat hata verirse eski snapshot/path
-        # GUVENILIR kalmaz → Print eski dosyayi otomatik basamaz. Basari yolunda
-        # asagida yeniden doldurulur. (Dialog Cancel yukarida donduğu icin bu satira
-        # ULASMAZ; iptal eski export'u KORUR.)
         self._export_snapshot = None
         self._last_gcode_path = None
         self._last_gcode_filename = None
-
-        # RPi4: G-code motoru diske stream eder + numpy-vektorize. Ayri worker yerine
-        # bekleme imleci + buton kilidi ile GUI durust kalir.
         self.export_gcode_btn.setEnabled(False)
         QApplication.setOverrideCursor(Qt.CursorShape.WaitCursor)
         try:
             if is_well:
-                moves = generate_gcode_multi_origin(
+                moves = generate_gcode_multi_head(
                     self._slices, self._infills, path,
-                    origins=origins, layer_height=layer_h,
-                    active_tool=active_tool, print_speed=print_speed)
+                    head_origins=head_origins,
+                    head_print_speeds={
+                        head: profiles[head]["print_speed_mm_s"] * 60.0
+                        for head in PRINTHEAD_IDS
+                    },
+                    layer_height=layer_height,
+                )
             else:
-                moves = generate_gcode(self._slices, self._infills, path,
-                                       layer_height=layer_h,
-                                       origin_x=bed_cx, origin_y=bed_cy,
-                                       active_tool=active_tool,
-                                       print_speed=print_speed)
+                self.selected_printhead = self.settings_tab.selected_printhead()
+                head = self.selected_printhead
+                moves = generate_gcode(
+                    self._slices, self._infills, path,
+                    layer_height=layer_height,
+                    origin_x=bed_cx, origin_y=bed_cy,
+                    active_tool=PRINTHEAD_TO_TOOL[head],
+                    print_speed=profiles[head]["print_speed_mm_s"] * 60.0,
+                )
         except Exception as exc:
-            QMessageBox.critical(self, "Export Hatası",
-                                 f"G-Code üretilemedi:\n{exc}")
+            QMessageBox.critical(self, "Export Hatası", f"G-Code üretilemedi:\n{exc}")
             return
         finally:
             QApplication.restoreOverrideCursor()
             self.export_gcode_btn.setEnabled(True)
 
-        # Export basarili → Print butonu bu dosyayi yukleyip baslatabilsin.
         self._last_gcode_path = path
         self._last_gcode_filename = Path(path).name
-
-        # Export snapshot: bu G-code HANGI slice + origins + tool + speed ile ve
-        # HANGI dosya kimligiyle uretildi. Print oncesi freshness kontrolu bunu okur.
         try:
-            _st = Path(path).stat()
-            _gsize, _gmtime = _st.st_size, _st.st_mtime_ns
+            stat = Path(path).stat()
+            size, mtime = stat.st_size, stat.st_mtime_ns
         except OSError:
-            _gsize, _gmtime = -1, -1
-        _cur_exp = self._current_export_params()
+            size, mtime = -1, -1
         self._export_snapshot = {
-            # deepcopy: sonraki bir slice _slice_snapshot'i degistirse bile bu
-            # export'un dayandigi snapshot BAGIMSIZ kalir (referans paylasmaz).
             "slice_snapshot": deepcopy(self._slice_snapshot),
-            "origins": _cur_exp["origins"],
-            "active_tool": _cur_exp["active_tool"],
-            "print_speed": _cur_exp["print_speed"],
+            "export_params": deepcopy(self._current_export_params()),
             "gcode_path": path,
-            "gcode_size": _gsize,
-            "gcode_mtime_ns": _gmtime,
+            "gcode_size": size,
+            "gcode_mtime_ns": mtime,
         }
-
-        if is_well:
-            wells_txt = ", ".join(w for w, _, _ in origins)
-            QMessageBox.information(
-                self, "G-Code Hazır",
-                f"G-Code kaydedildi:\n{path}\n\n"
-                f"{moves} ekstrüzyon hamlesi · {len(self._slices)} katman.\n"
-                f"Selected wells: {wells_txt}\nCopies: {len(origins)} · "
-                f"{active_tool} · {speed_mms:.0f} mm/s")
-        else:
-            QMessageBox.information(
-                self, "G-Code Hazır",
-                f"G-Code kaydedildi:\n{path}\n\n"
-                f"{moves} ekstrüzyon hamlesi · {len(self._slices)} katman.\n"
-                f"Kuyu: yok (yatak merkezi) · Origin ({bed_cx:.1f}, {bed_cy:.1f}) · "
-                f"{active_tool} · {speed_mms:.0f} mm/s")
-
+        plan_text = (
+            ", ".join(f"{well}=PH{head}" for well, head in sorted(self.well_assignments.items()))
+            if is_well else f"PH{self.selected_printhead}"
+        )
+        QMessageBox.information(
+            self, "G-Code Hazır",
+            f"G-Code kaydedildi:\n{path}\n\n{moves} ekstrüzyon hamlesi · "
+            f"{len(self._slices)} katman.\nPlan: {plan_text}")
     def _init_settings_plotter(self) -> None:
         if pv is None or QtInteractor is None or self.layer_plotter_frame is None:
             return

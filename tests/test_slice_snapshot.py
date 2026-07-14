@@ -34,6 +34,11 @@ def run():
     _simulate_slice(w)
     c.chk("right after slice -> NOT dirty", w._slice_is_dirty() is False)
 
+    # Nozzle Diameter is currently protocol-only; slicer geometry does not read it.
+    w.settings_tab.nozzle_diameter_spins[1].setValue(0.55)
+    c.chk("change Nozzle Diameter -> NOT slice dirty", w._slice_is_dirty() is False)
+    w.settings_tab.nozzle_diameter_spins[1].setValue(0.40)
+
     # --- geometry-affecting changes -> DIRTY ---
     w.kutu_layer.setValue(0.10)
     c.chk("change Layer Thickness -> dirty", w._slice_is_dirty() is True)
@@ -61,19 +66,18 @@ def run():
     c.chk("restore STL + re-slice -> not dirty", w._slice_is_dirty() is False)
 
     # --- NON-geometry changes -> NOT dirty (same slice, different origin/feed/temp) ---
-    w._selected_wells = {"A1", "A2", "B3", "C4"}
+    w.well_assignments.update({"A1": 1, "A2": 1, "B3": 2, "C4": 3})
     c.chk("change selected wells -> NOT dirty (multi-origin reuse)", w._slice_is_dirty() is False)
 
-    if w.kutu_speed:
-        w.kutu_speed.setValue(25)
+    if w.settings_tab.print_speed_spins[1]:
+        w.settings_tab.print_speed_spins[1].setValue(25)
         c.chk("change Print Speed -> NOT dirty", w._slice_is_dirty() is False)
-    if w.ph_buton_grubu:
-        btn = w.ph_buton_grubu.button(2)
-        if btn:
-            btn.setChecked(True)
+    if w.printhead_tabs:
+        w.printhead_tabs.setCurrentIndex(1)
         c.chk("change Printhead -> NOT dirty", w._slice_is_dirty() is False)
-    if w.kutu_ph_temp:
-        w.kutu_ph_temp.blockSignals(True); w.kutu_ph_temp.setValue(35.0); w.kutu_ph_temp.blockSignals(False)
+    if w.settings_tab.printhead_temperature_spins[1]:
+        temp = w.settings_tab.printhead_temperature_spins[1]
+        temp.blockSignals(True); temp.setValue(35.0); temp.blockSignals(False)
         c.chk("change Printhead Temp -> NOT dirty", w._slice_is_dirty() is False)
 
     # export layer height comes from SNAPSHOT, not the widget

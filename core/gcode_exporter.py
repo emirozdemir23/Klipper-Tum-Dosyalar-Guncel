@@ -20,6 +20,8 @@ import os
 
 import numpy as np
 
+from core.printhead import PRINTHEAD_TO_TOOL
+
 # Gaps longer than this (mm) become a non-printing travel move; shorter ones are
 # bridged by the next extrusion (continuous bioprinting tolerates sub-mm stitch).
 _TRAVEL_THRESHOLD = 1.5
@@ -156,7 +158,7 @@ def _highest_nonempty_layer(slices: list, infills: list) -> int:
 
 def generate_gcode(slices: list, infills: list, save_path: str,
                    layer_height: float = 0.2, flow_multiplier: float = 0.05,
-                   active_tool: str = "T0",
+                   active_tool: str = PRINTHEAD_TO_TOOL[1],
                    origin_x: float = 120.0, origin_y: float = 60.0,
                    print_speed: float = 600.0,
                    x_max: float = _BED_X_MAX, y_max: float = _BED_Y_MAX,
@@ -311,7 +313,7 @@ def generate_gcode_multi_origin(slices: list, infills: list, save_path: str,
                                 origins: list,
                                 layer_height: float = 0.2,
                                 flow_multiplier: float = 0.05,
-                                active_tool: str = "T0",
+                                active_tool: str = PRINTHEAD_TO_TOOL[1],
                                 print_speed: float = 600.0,
                                 x_max: float = _BED_X_MAX,
                                 y_max: float = _BED_Y_MAX,
@@ -459,4 +461,138 @@ def generate_gcode_multi_origin(slices: list, infills: list, save_path: str,
         raise
     os.replace(tmp_path, save_path)   # atomik
 
+    return moves
+
+
+def generate_gcode_multi_head(
+        slices: list, infills: list, save_path: str,
+        head_origins: dict[int, list], head_print_speeds: dict[int, float],
+        layer_height: float = 0.2, flow_multiplier: float = 0.05,
+        x_max: float = _BED_X_MAX, y_max: float = _BED_Y_MAX,
+        z_max: float = _BED_Z_MAX, inter_well_lift: float = 2.0,
+        abort_check=None) -> int:
+    """Export layer-major -> printhead-major -> assigned-well G-code.
+
+    ``head_origins`` maps 1/2/3 to ``(well_id, x, y)`` tuples.  Nozzle
+    diameter is deliberately absent: the established relative-E mathematics is
+    unchanged.  Output is streamed to a temporary file and atomically replaced.
+    """
+    if not isinstance(head_origins, dict):
+        raise ValueError("head_origins bir dict olmalidir.")
+    invalid_heads = [
+        head for head in head_origins
+        if isinstance(head, bool) or head not in PRINTHEAD_TO_TOOL
+    ]
+    if invalid_heads:
+        raise ValueError(
+            "Gecersiz printhead ID: " + ", ".join(repr(head) for head in invalid_heads))
+
+    normalized: dict[int, list[tuple[str, float, float]]] = {}
+    for head in (1, 2, 3):
+        origins = head_origins.get(head, []) if isinstance(head_origins, dict) else []
+        if origins:
+            normalized[head] = [
+                (str(well), float(origin_x), float(origin_y))
+                for well, origin_x, origin_y in origins
+            ]
+    if not normalized:
+        raise ValueError("well_assignments bos: en az bir atanmis kuyu gerekli.")
+
+    extents = _xy_extents(slices, infills)
+    if extents is None:
+        raise ValueError("Dilim verisi bos: hicbir katmanda cizgi yok - G-code uretilmedi.")
+    sx_min, sx_max, sy_min, sy_max = extents
+    for origins in normalized.values():
+        for well_id, origin_x, origin_y in origins:
+            fx_min, fx_max = sx_min + origin_x, sx_max + origin_x
+            fy_min, fy_max = sy_min + origin_y, sy_max + origin_y
+            if fx_min < 0.0 or fx_max > x_max or fy_min < 0.0 or fy_max > y_max:
+                raise ValueError(
+                    f"Kuyu '{well_id}' yatak limitlerinin disina tasiyor:\n"
+                    f"X [{fx_min:.1f} .. {fx_max:.1f}] (izinli 0 .. {x_max:.0f}), "
+                    f"Y [{fy_min:.1f} .. {fy_max:.1f}] (izinli 0 .. {y_max:.0f}).")
+
+    lift = max(0.0, float(inter_well_lift))
+    highest = _highest_nonempty_layer(slices, infills)
+    highest_z = (highest + 1) * layer_height if highest >= 0 else 0.0
+    if highest_z + lift > z_max:
+        raise ValueError(
+            f"Model + lift Z sinirini asiyor: {highest_z + lift:.2f} > {z_max:.1f} mm.")
+
+    speeds = {
+        head: min(max(1.0, float(head_print_speeds.get(head, 600.0))), _MAX_XY_FEED)
+        for head in normalized
+    }
+    moves = 0
+    current_xy = (0.0, 0.0)
+    first_descent_done = False
+    active_head = None
+    tmp_path = save_path + ".tmp"
+    try:
+        with open(tmp_path, "w", encoding="utf-8") as handle:
+            handle.write("PRINT_START\nG90\nG92 E0\nM83\n")
+            for layer_index in range(len(slices)):
+                if abort_check is not None and abort_check():
+                    raise RuntimeError("G-code export aborted")
+                perimeter = _segments_xy(slices[layer_index])
+                infill = _segments_xy(
+                    infills[layer_index] if infills and layer_index < len(infills) else None)
+                if perimeter.shape[0] == 0 and infill.shape[0] == 0:
+                    continue
+                z = (layer_index + 1) * layer_height
+                for head in (1, 2, 3):
+                    origins = normalized.get(head, [])
+                    if not origins:
+                        continue
+                    if active_head != head:
+                        handle.write(f"{PRINTHEAD_TO_TOOL[head]}\n")
+                        active_head = head
+                    speed = speeds[head]
+                    for well_id, origin_x, origin_y in origins:
+                        shift = np.array([origin_x, origin_y], dtype=np.float64)
+                        groups = []
+                        if perimeter.shape[0]:
+                            groups.append(perimeter + shift)
+                        if infill.shape[0]:
+                            groups.append(infill + shift)
+                        buffer = [
+                            f"; LAYER {layer_index} PH{head} WELL {well_id} (z={z:.3f})"]
+                        well_started = False
+                        for group in groups:
+                            for entry, exit_, gap in _order_layer_segments(group, current_xy):
+                                if not first_descent_done:
+                                    buffer.append(
+                                        f"G0 X{entry[0]:.3f} Y{entry[1]:.3f} F{_MAX_XY_FEED:.0f}")
+                                    buffer.append(f"G0 Z{z:.3f} F600")
+                                    first_descent_done = True
+                                elif not well_started:
+                                    buffer.append(f"G0 Z{z + lift:.3f} F600")
+                                    buffer.append(
+                                        f"G0 X{entry[0]:.3f} Y{entry[1]:.3f} F{_MAX_XY_FEED:.0f}")
+                                    buffer.append(f"G0 Z{z:.3f} F600")
+                                elif gap > _TRAVEL_THRESHOLD:
+                                    buffer.append(
+                                        f"G0 X{entry[0]:.3f} Y{entry[1]:.3f} F{_MAX_XY_FEED:.0f}")
+                                elif gap > 1e-6:
+                                    buffer.append(
+                                        f"G1 X{entry[0]:.3f} Y{entry[1]:.3f} "
+                                        f"E{gap * flow_multiplier:.4f} F{speed:.0f}")
+                                    moves += 1
+                                    current_xy = (float(entry[0]), float(entry[1]))
+                                well_started = True
+                                length = math.hypot(exit_[0] - entry[0], exit_[1] - entry[1])
+                                buffer.append(
+                                    f"G1 X{exit_[0]:.3f} Y{exit_[1]:.3f} "
+                                    f"E{length * flow_multiplier:.4f} F{speed:.0f}")
+                                moves += 1
+                                current_xy = (float(exit_[0]), float(exit_[1]))
+                        handle.write("\n".join(buffer) + "\n")
+            handle.write("PRINT_END\n")
+    except BaseException:
+        try:
+            os.remove(tmp_path)
+        except OSError:
+            pass
+        raise
+    os.replace(tmp_path, save_path)
     return moves

@@ -42,7 +42,7 @@ def _mk(kind_id, wells):
     f._render_last_idx = -1
     f._original_mesh = pv.Sphere(radius=3.0)
     f.bp_buton_grubu = SimpleNamespace(checkedId=lambda: kind_id)
-    f._selected_wells = set(wells)
+    f.well_assignments = {well: 1 for well in wells}
     f._well_registry = {w: {"center": (0.0, 0.0)} for w in wells}
     f._preview_well_actor_names = []
     f.layer_nav_label = SimpleNamespace(setText=lambda *_: None)

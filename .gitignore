@@ -13,3 +13,5 @@ data/protocols/
 # Crash log and temp files
 crash.log
 *.tmp
+
+.agents/
